@@ -1,0 +1,6 @@
+{
+  "name": "Bro Radius",
+  "description": "نظام إدارة شبكات الإنترنت ومراقبة راوترات مايكروتك عبر نفق WireGuard المشفر.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
