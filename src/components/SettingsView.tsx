@@ -6,10 +6,13 @@ import {
   CheckCircle2,
   Copy,
   FileCheck,
+  Globe,
+  Lock,
   LogOut,
   Moon,
   Plus,
   RefreshCw,
+  Router,
   Send,
   Server,
   Shield,
@@ -27,6 +30,7 @@ import type {
   TeamMember,
   ThemeMode,
   TowerNode,
+  UnifiedCpeCredentials,
   UserRole,
   VpsRelayStatus,
 } from '../types';
@@ -95,6 +99,17 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     totalDebtIqd: number;
   } | null>(null);
 
+  // Unified CPE Credentials (for subscriber routers without TR-069)
+  const [unifiedCpe, setUnifiedCpe] = useState<UnifiedCpeCredentials>({
+    enabled: true,
+    authMode: 'user_pass',
+    username: 'admin',
+    hasPassword: false,
+    defaultPort: 80,
+  });
+  const [unifiedCpePass, setUnifiedCpePass] = useState('');
+  const [savingUnifiedCpe, setSavingUnifiedCpe] = useState(false);
+
   const [newName, setNewName] = useState('');
   const [newEmail, setNewEmail] = useState('');
   const [newPass, setNewPass] = useState('');
@@ -119,12 +134,19 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       fetch('/api/settings', { headers: { Authorization: `Bearer ${token}` } }),
       fetch('/api/digest', { headers: { Authorization: `Bearer ${token}` } }),
       fetch('/api/capabilities', { headers: { Authorization: `Bearer ${token}` } }),
+      fetch('/api/cpe/unified-creds', { headers: { Authorization: `Bearer ${token}` } }),
     ];
     if (user.role === 'admin') {
       reqs.push(fetch('/api/vps/status', { headers: { Authorization: `Bearer ${token}` } }));
     }
-    const [setRes, digRes, capRes, vpsRes] = await Promise.all(reqs);
-    if (setRes.status === 401 || digRes.status === 401 || capRes.status === 401 || vpsRes?.status === 401) {
+    const [setRes, digRes, capRes, cpeRes, vpsRes] = await Promise.all(reqs);
+    if (
+      setRes.status === 401 ||
+      digRes.status === 401 ||
+      capRes.status === 401 ||
+      cpeRes.status === 401 ||
+      vpsRes?.status === 401
+    ) {
       onLogout();
       return;
     }
@@ -140,6 +162,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     if (capRes.ok) {
       setCapabilities((await capRes.json()) as ServerCapabilities);
     }
+    if (cpeRes && cpeRes.ok) {
+      const cData = (await cpeRes.json()) as UnifiedCpeCredentials;
+      setUnifiedCpe(cData);
+    }
     if (vpsRes && vpsRes.ok) {
       const vData = (await vpsRes.json()) as {
         status: VpsRelayStatus;
@@ -154,6 +180,37 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       setVpsInstallScript(vData.installScript);
       setVpsCloudShellScript(vData.cloudShellScript);
       if (vData.status.lastError) setVpsError(vData.status.lastError);
+    }
+  };
+
+  const handleSaveUnifiedCpe = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSavingUnifiedCpe(true);
+    try {
+      const res = await fetch('/api/cpe/unified-creds', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          enabled: unifiedCpe.enabled,
+          authMode: unifiedCpe.authMode,
+          username: unifiedCpe.username,
+          password: unifiedCpePass.trim() || undefined,
+          defaultPort: Number(unifiedCpe.defaultPort) || 80,
+        }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setUnifiedCpePass('');
+        setStatusMsg('تم حفظ إعدادات الدخول الموحدة لراوترات المشتركين بنجاح');
+        void loadSettings();
+      } else {
+        setStatusMsg(data.error || 'تعذر حفظ إعدادات راوترات المشتركين');
+      }
+    } finally {
+      setSavingUnifiedCpe(false);
     }
   };
 
@@ -753,6 +810,118 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             className="min-h-[42px] px-5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold"
           >
             حفظ إعدادات TR-069 / RADIUS / التوربو
+          </button>
+        </form>
+      )}
+
+      {/* Unified CPE Credentials for Routers without TR-069 */}
+      {(user.role === 'admin' || user.role === 'technician') && (
+        <form
+          onSubmit={(e) => void handleSaveUnifiedCpe(e)}
+          className="rounded-[22px] bg-white dark:bg-[#11151E] border border-slate-200/80 dark:border-white/[0.07] p-5 space-y-4"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2 text-sm font-bold text-slate-900 dark:text-white">
+              <Router className="w-4 h-4 text-sky-500" />
+              <span>بيانات الدخول الموحدة لراوترات المشتركين (بدون TR-069)</span>
+            </div>
+            <span className="text-xs font-bold px-2.5 py-1 rounded-lg bg-sky-500/15 text-sky-600 dark:text-sky-400">
+              {unifiedCpe.enabled ? 'مفعّلة للشبكة' : 'معطّلة'}
+            </span>
+          </div>
+
+          <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
+            تعتمد معظم الشبكات على كلمة مرور موحدة لجميع راوترات المشتركين (مثل Tenda و TP-Link و Mercusys). عند تفعيل هذا الخيار، يتم جلب موديل الراوتر، الفيرموير، واسم شبكة الواي فاي (SSID) وحالة الاتصال تلقائياً عبر واجهة الويب مباشرة عند فحص المشترك حتى لو لم يكن الراوتر يدعم TR-069.
+          </p>
+
+          <div className="flex items-center justify-between rounded-xl bg-slate-50 dark:bg-[#171C28] p-3 text-xs font-bold text-slate-700 dark:text-slate-200">
+            <span>تفعيل استخدام كلمة المرور الموحدة لراوترات المشتركين</span>
+            <input
+              type="checkbox"
+              checked={unifiedCpe.enabled}
+              onChange={(e) => setUnifiedCpe((p) => ({ ...p, enabled: e.target.checked }))}
+              className="w-4 h-4 accent-sky-500"
+            />
+          </div>
+
+          <div className="space-y-3">
+            <div className="flex flex-wrap items-center gap-2 text-xs font-bold text-slate-700 dark:text-slate-300">
+              <span>نوع تسجيل الدخول للراوترات:</span>
+              <div className="inline-flex rounded-xl border border-slate-200 dark:border-white/[0.1] p-1 bg-slate-50 dark:bg-[#171C28]">
+                <button
+                  type="button"
+                  onClick={() => setUnifiedCpe((p) => ({ ...p, authMode: 'user_pass' }))}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-colors ${
+                    unifiedCpe.authMode === 'user_pass'
+                      ? 'bg-sky-600 text-white shadow-sm'
+                      : 'text-slate-500 hover:text-slate-800 dark:hover:text-white'
+                  }`}
+                >
+                  اسم مستخدم وكلمة مرور (MikroTik / Huawei / عام)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setUnifiedCpe((p) => ({ ...p, authMode: 'pass_only' }))}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-colors ${
+                    unifiedCpe.authMode === 'pass_only'
+                      ? 'bg-sky-600 text-white shadow-sm'
+                      : 'text-slate-500 hover:text-slate-800 dark:hover:text-white'
+                  }`}
+                >
+                  كلمة مرور فقط (Tenda F3/AC و TP-Link و Mercusys)
+                </button>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+              {unifiedCpe.authMode === 'user_pass' && (
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-500 mb-1">اسم المستخدم الموحد</label>
+                  <input
+                    type="text"
+                    dir="ltr"
+                    value={unifiedCpe.username}
+                    onChange={(e) => setUnifiedCpe((p) => ({ ...p, username: e.target.value }))}
+                    placeholder="admin"
+                    className="w-full min-h-[42px] rounded-xl border border-slate-200 dark:border-white/[0.09] bg-slate-50 dark:bg-[#171C28] px-3 font-mono text-slate-900 dark:text-white"
+                  />
+                </div>
+              )}
+              <div className={unifiedCpe.authMode === 'pass_only' ? 'sm:col-span-2' : ''}>
+                <label className="block text-[11px] font-bold text-slate-500 mb-1">
+                  {unifiedCpe.authMode === 'pass_only' ? 'كلمة المرور الموحدة للراوتر (بدون اسم مستخدم)' : 'كلمة المرور الموحدة للراوترات'}
+                </label>
+                <input
+                  type="password"
+                  dir="ltr"
+                  value={unifiedCpePass}
+                  onChange={(e) => setUnifiedCpePass(e.target.value)}
+                  placeholder={unifiedCpe.hasPassword ? 'كلمة المرور محفوظة (اكتب لتحديثها)' : 'أدخل كلمة مرور راوترات المشتركين'}
+                  className="w-full min-h-[42px] rounded-xl border border-slate-200 dark:border-white/[0.09] bg-slate-50 dark:bg-[#171C28] px-3 font-mono text-slate-900 dark:text-white"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-bold text-slate-500 mb-1">المنفذ الافتراضي للويب (Port)</label>
+                <input
+                  type="number"
+                  dir="ltr"
+                  min={1}
+                  max={65535}
+                  value={unifiedCpe.defaultPort || 80}
+                  onChange={(e) => setUnifiedCpe((p) => ({ ...p, defaultPort: Number(e.target.value) || 80 }))}
+                  placeholder="80"
+                  className="w-full min-h-[42px] rounded-xl border border-slate-200 dark:border-white/[0.09] bg-slate-50 dark:bg-[#171C28] px-3 font-mono text-slate-900 dark:text-white"
+                />
+              </div>
+            </div>
+          </div>
+
+          <button
+            type="submit"
+            disabled={savingUnifiedCpe}
+            className="min-h-[42px] px-5 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-xs font-bold inline-flex items-center gap-1.5 disabled:opacity-60"
+          >
+            {savingUnifiedCpe ? 'جاري الحفظ...' : 'حفظ بيانات الدخول الموحدة'}
           </button>
         </form>
       )}

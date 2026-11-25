@@ -77,10 +77,16 @@ WG_SERVER_PORT=51820
 SESSION_SECRET=${SECRET_HEX}
 EOF
 
-npm install --legacy-peer-deps
+npm install --legacy-peer-deps --include=dev
+npm install -g tsx >/dev/null 2>&1 || true
 npm run build
 
 echo "==> Creating systemd service (bro-radius)..."
+TSX_BIN="$(command -v tsx || echo "${APP_DIR}/node_modules/.bin/tsx")"
+if [[ ! -x "$TSX_BIN" ]]; then
+  TSX_BIN="$(command -v node) ${APP_DIR}/node_modules/tsx/dist/cli.mjs"
+fi
+
 cat >/etc/systemd/system/bro-radius.service <<EOF
 [Unit]
 Description=Bro Radius MikroTik Management Server
@@ -90,7 +96,7 @@ After=network.target wg-quick@wg0.service
 Type=simple
 WorkingDirectory=${APP_DIR}
 EnvironmentFile=${APP_DIR}/.env
-ExecStart=/usr/bin/node server.ts
+ExecStart=${TSX_BIN} server.ts
 Restart=always
 RestartSec=3
 

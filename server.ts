@@ -47,6 +47,7 @@ import {
   estimateCpeDevicesFromMikroTik,
   fetchGenieAcsCpe,
   type GenieAcsConfig,
+  probeAndFetchCpeHttpData,
   proxyCpeHttpPage,
   pushGenieAcsTask,
 } from './src/server/cpeManager.ts';
@@ -3159,6 +3160,57 @@ async function startServer(): Promise<void> {
     };
   }
 
+  function getOwnerUnifiedCpeCreds(ownerId: string): {
+    enabled: boolean;
+    authMode: 'user_pass' | 'pass_only';
+    username: string;
+    password: string;
+    defaultPort: number;
+  } {
+    const row = db
+      .prepare('SELECT value FROM app_meta WHERE key = ?')
+      .get(`cpe_unified_${ownerId}`) as { value: string } | undefined;
+    if (!row) {
+      return { enabled: true, authMode: 'user_pass', username: 'admin', password: 'admin', defaultPort: 80 };
+    }
+    try {
+      const p = JSON.parse(row.value);
+      return {
+        enabled: p.enabled ?? true,
+        authMode: p.authMode === 'pass_only' ? 'pass_only' : 'user_pass',
+        username: typeof p.username === 'string' ? p.username : 'admin',
+        password: p.passwordEnc ? decryptSecret(p.passwordEnc) : typeof p.password === 'string' ? p.password : 'admin',
+        defaultPort: Number(p.defaultPort) || 80,
+      };
+    } catch {
+      return { enabled: true, authMode: 'user_pass', username: 'admin', password: 'admin', defaultPort: 80 };
+    }
+  }
+
+  function saveOwnerUnifiedCpeCreds(
+    ownerId: string,
+    creds: {
+      enabled: boolean;
+      authMode: 'user_pass' | 'pass_only';
+      username: string;
+      password?: string;
+      defaultPort: number;
+    }
+  ): void {
+    const prev = getOwnerUnifiedCpeCreds(ownerId);
+    const pass = creds.password !== undefined && creds.password !== '' ? creds.password : prev.password;
+    const toSave = {
+      enabled: creds.enabled,
+      authMode: creds.authMode,
+      username: creds.username.trim() || 'admin',
+      passwordEnc: pass ? encryptSecret(pass) : '',
+      defaultPort: Number(creds.defaultPort) || 80,
+    };
+    db.prepare(
+      'INSERT INTO app_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
+    ).run(`cpe_unified_${ownerId}`, JSON.stringify(toSave));
+  }
+
   function hydrateCpeDevice(subRow: Record<string, unknown>): CpeDeviceInfo {
     const subId = String(subRow.id);
     const c = db.prepare('SELECT * FROM cpe_devices WHERE subscriber_id = ?').get(subId) as Record<string, unknown> | undefined;
@@ -3169,6 +3221,10 @@ async function startServer(): Promise<void> {
         tr069DeviceId: null,
         cpeHost: subRow.ip ? String(subRow.ip) : null,
         cpePort: 80,
+        cpeUser: 'admin',
+        authMode: 'user_pass',
+        useUnified: true,
+        httpStatus: null,
         model: null,
         serialNumber: null,
         firmware: null,
@@ -3194,6 +3250,10 @@ async function startServer(): Promise<void> {
       tr069DeviceId: c.tr069_device_id ? String(c.tr069_device_id) : null,
       cpeHost: c.cpe_host ? String(c.cpe_host) : subRow.ip ? String(subRow.ip) : null,
       cpePort: Number(c.cpe_port || 80),
+      cpeUser: String(c.cpe_user || 'admin'),
+      authMode: (c.auth_mode as 'user_pass' | 'pass_only') || 'user_pass',
+      useUnified: c.use_unified !== undefined && c.use_unified !== null ? Boolean(c.use_unified) : true,
+      httpStatus: c.http_status ? String(c.http_status) : null,
       model: c.model ? String(c.model) : null,
       serialNumber: c.serial_number ? String(c.serial_number) : null,
       firmware: c.firmware ? String(c.firmware) : null,
@@ -3244,6 +3304,42 @@ async function startServer(): Promise<void> {
     });
   });
 
+  app.get('/api/cpe/unified-creds', requireAuth, (req: AuthedRequest, res: Response) => {
+    const creds = getOwnerUnifiedCpeCreds(req.user!.ownerId);
+    res.json({
+      enabled: creds.enabled,
+      authMode: creds.authMode,
+      username: creds.username,
+      hasPassword: Boolean(creds.password),
+      defaultPort: creds.defaultPort,
+    });
+  });
+
+  app.post('/api/cpe/unified-creds', requireAuth, requireRole(['admin', 'technician']), (req: AuthedRequest, res: Response) => {
+    const ownerId = req.user!.ownerId;
+    const { enabled = true, authMode = 'user_pass', username = 'admin', password, defaultPort = 80 } = req.body as Record<string, unknown>;
+    const prev = getOwnerUnifiedCpeCreds(ownerId);
+    const cleanPass = typeof password === 'string' && password !== '' ? password : prev.password;
+    saveOwnerUnifiedCpeCreds(ownerId, {
+      enabled: Boolean(enabled),
+      authMode: authMode === 'pass_only' ? 'pass_only' : 'user_pass',
+      username: String(username || 'admin').trim(),
+      password: cleanPass,
+      defaultPort: Number(defaultPort) || 80,
+    });
+    res.json({
+      ok: true,
+      message: 'تم حفظ إعدادات الدخول الموحدة لراوترات المشتركين',
+      creds: {
+        enabled: Boolean(enabled),
+        authMode: authMode === 'pass_only' ? 'pass_only' : 'user_pass',
+        username: String(username || 'admin').trim(),
+        hasPassword: Boolean(cleanPass),
+        defaultPort: Number(defaultPort) || 80,
+      },
+    });
+  });
+
   app.patch(
     '/api/subscribers/:id/cpe/config',
     requireAuth,
@@ -3257,7 +3353,15 @@ async function startServer(): Promise<void> {
         res.status(404).json({ error: 'المشترك غير موجود' });
         return;
       }
-      const { tr069DeviceId, cpeHost, cpePort = 80, cpeUser = '', cpePass = '' } = req.body as Record<string, unknown>;
+      const {
+        tr069DeviceId,
+        cpeHost,
+        cpePort = 80,
+        cpeUser,
+        cpePass,
+        useUnified,
+        authMode,
+      } = req.body as Record<string, unknown>;
       db.prepare('INSERT OR IGNORE INTO cpe_devices (subscriber_id, owner_id) VALUES (?, ?)').run(req.params.id, ownerId);
       db.prepare(`
         UPDATE cpe_devices SET
@@ -3265,7 +3369,9 @@ async function startServer(): Promise<void> {
           cpe_host = COALESCE(?, cpe_host),
           cpe_port = COALESCE(?, cpe_port),
           cpe_user = COALESCE(?, cpe_user),
-          cpe_pass_enc = CASE WHEN ? != '' THEN ? ELSE cpe_pass_enc END
+          cpe_pass_enc = CASE WHEN ? != '' THEN ? ELSE cpe_pass_enc END,
+          use_unified = COALESCE(?, use_unified),
+          auth_mode = COALESCE(?, auth_mode)
         WHERE subscriber_id = ?
       `).run(
         typeof tr069DeviceId === 'string' ? tr069DeviceId.trim() : null,
@@ -3274,11 +3380,97 @@ async function startServer(): Promise<void> {
         typeof cpeUser === 'string' ? cpeUser.trim() : null,
         typeof cpePass === 'string' && cpePass ? encryptSecret(cpePass) : '',
         typeof cpePass === 'string' && cpePass ? encryptSecret(cpePass) : '',
+        useUnified !== undefined ? (useUnified ? 1 : 0) : null,
+        typeof authMode === 'string' ? authMode : null,
         req.params.id
       );
       res.json({ cpe: hydrateCpeDevice(sub) });
     }
   );
+
+  app.post('/api/subscribers/:id/cpe/http-fetch', requireAuth, async (req: AuthedRequest, res: Response) => {
+    const ownerId = req.user!.ownerId;
+    const sub = db
+      .prepare('SELECT * FROM subscribers WHERE id = ? AND owner_id = ?')
+      .get(req.params.id, ownerId) as Record<string, unknown> | undefined;
+    if (!sub || !canAccessTower(req, sub.tower_id ? String(sub.tower_id) : null)) {
+      res.status(404).json({ error: 'المشترك غير موجود' });
+      return;
+    }
+    const targetHost = String(sub.ip || '').trim();
+    if (!targetHost) {
+      res.status(400).json({ error: 'المشترك غير متصل حالياً (لا يوجد عنوان IP)' });
+      return;
+    }
+
+    db.prepare('INSERT OR IGNORE INTO cpe_devices (subscriber_id, owner_id) VALUES (?, ?)').run(req.params.id, ownerId);
+    const existingCpe = db.prepare('SELECT * FROM cpe_devices WHERE subscriber_id = ?').get(req.params.id) as Record<string, unknown>;
+
+    const unified = getOwnerUnifiedCpeCreds(ownerId);
+    const useUnified = existingCpe.use_unified !== undefined && existingCpe.use_unified !== null ? Boolean(existingCpe.use_unified) : true;
+
+    let authMode: 'user_pass' | 'pass_only' = (existingCpe.auth_mode as 'user_pass' | 'pass_only') || 'user_pass';
+    let username = String(existingCpe.cpe_user || 'admin');
+    let password = existingCpe.cpe_pass_enc ? decryptSecret(String(existingCpe.cpe_pass_enc)) : '';
+    let port = Number(existingCpe.cpe_port || 80);
+
+    if (useUnified && unified.enabled) {
+      authMode = unified.authMode;
+      username = unified.username;
+      password = unified.password;
+      port = unified.defaultPort || port || 80;
+    }
+
+    const probe = await probeAndFetchCpeHttpData({
+      host: existingCpe.cpe_host ? String(existingCpe.cpe_host) : targetHost,
+      port,
+      authMode,
+      username,
+      password,
+      subMac: String(sub.mac || ''),
+    });
+
+    const nowIso = new Date().toISOString();
+    if (probe.success) {
+      db.prepare(`
+        UPDATE cpe_devices SET
+          source = 'http_web',
+          model = COALESCE(?, model),
+          firmware = COALESCE(?, firmware),
+          wifi_ssid_24 = COALESCE(?, wifi_ssid_24),
+          wifi_channel_24 = COALESCE(?, wifi_channel_24),
+          uptime_sec = COALESCE(?, uptime_sec),
+          wan_ip = ?,
+          http_status = ?,
+          last_synced_at = ?
+        WHERE subscriber_id = ?
+      `).run(
+        probe.model,
+        probe.firmware,
+        probe.wifiSsid24,
+        probe.wifiChannel24,
+        probe.uptimeSec,
+        targetHost,
+        probe.message,
+        nowIso,
+        req.params.id
+      );
+    } else {
+      db.prepare(`
+        UPDATE cpe_devices SET
+          http_status = ?,
+          last_synced_at = ?
+        WHERE subscriber_id = ?
+      `).run(probe.message, nowIso, req.params.id);
+    }
+
+    res.json({
+      ok: probe.success,
+      probe,
+      cpe: hydrateCpeDevice(sub),
+      message: probe.message,
+    });
+  });
 
   app.post('/api/subscribers/:id/cpe/sync', requireAuth, async (req: AuthedRequest, res: Response) => {
     const ownerId = req.user!.ownerId;
@@ -3294,7 +3486,7 @@ async function startServer(): Promise<void> {
     db.prepare('INSERT OR IGNORE INTO cpe_devices (subscriber_id, owner_id) VALUES (?, ?)').run(req.params.id, ownerId);
     const existingCpe = db.prepare('SELECT * FROM cpe_devices WHERE subscriber_id = ?').get(req.params.id) as Record<string, unknown>;
 
-    // Try GenieACS TR-069 first if configured (#18)
+    // 1. Try GenieACS TR-069 first if configured (#18)
     const genieCfg = getOwnerGenieAcsConfig(ownerId);
     let genieMatched = false;
     if (genieCfg) {
@@ -3323,7 +3515,63 @@ async function startServer(): Promise<void> {
           );
         }
       } catch {
-        // Fallback to MikroTik Conntrack estimator (#20)
+        // Fallback to HTTP Web Probe or MikroTik Conntrack
+      }
+    }
+
+    // 2. If no TR-069 match, attempt direct HTTP Web Probe (supports unified credentials & password-only)
+    if (!genieMatched && sub.ip) {
+      try {
+        const unified = getOwnerUnifiedCpeCreds(ownerId);
+        const useUnified = existingCpe.use_unified !== undefined && existingCpe.use_unified !== null ? Boolean(existingCpe.use_unified) : true;
+        let authMode: 'user_pass' | 'pass_only' = (existingCpe.auth_mode as 'user_pass' | 'pass_only') || 'user_pass';
+        let username = String(existingCpe.cpe_user || 'admin');
+        let password = existingCpe.cpe_pass_enc ? decryptSecret(String(existingCpe.cpe_pass_enc)) : '';
+        let port = Number(existingCpe.cpe_port || 80);
+
+        if (useUnified && unified.enabled) {
+          authMode = unified.authMode;
+          username = unified.username;
+          password = unified.password;
+          port = unified.defaultPort || port || 80;
+        }
+
+        const probe = await probeAndFetchCpeHttpData({
+          host: existingCpe.cpe_host ? String(existingCpe.cpe_host) : String(sub.ip),
+          port,
+          authMode,
+          username,
+          password,
+          subMac: String(sub.mac || ''),
+        });
+
+        if (probe.success) {
+          db.prepare(`
+            UPDATE cpe_devices SET
+              source = 'http_web',
+              model = COALESCE(?, model),
+              firmware = COALESCE(?, firmware),
+              wifi_ssid_24 = COALESCE(?, wifi_ssid_24),
+              wifi_channel_24 = COALESCE(?, wifi_channel_24),
+              uptime_sec = COALESCE(?, uptime_sec),
+              wan_ip = ?,
+              http_status = ?,
+              last_synced_at = ?
+            WHERE subscriber_id = ?
+          `).run(
+            probe.model,
+            probe.firmware,
+            probe.wifiSsid24,
+            probe.wifiChannel24,
+            probe.uptimeSec,
+            String(sub.ip),
+            probe.message,
+            nowIso,
+            req.params.id
+          );
+        }
+      } catch {
+        // Continue to MikroTik estimation
       }
     }
 
@@ -3349,7 +3597,8 @@ async function startServer(): Promise<void> {
           });
           db.prepare(`
             UPDATE cpe_devices SET
-              source = 'mikrotik_conntrack', model = COALESCE(model, ?), wan_ip = ?,
+              source = CASE WHEN source = 'http_web' THEN 'http_web' ELSE 'mikrotik_conntrack' END,
+              model = COALESCE(model, ?), wan_ip = ?,
               connected_count = ?, connected_hosts_json = ?, last_synced_at = ?
             WHERE subscriber_id = ?
           `).run(

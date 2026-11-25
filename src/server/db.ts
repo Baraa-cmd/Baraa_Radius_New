@@ -298,6 +298,9 @@ db.exec(`
     tr143_up_mbps REAL,
     last_config_backup_json TEXT,
     last_synced_at TEXT,
+    use_unified INTEGER NOT NULL DEFAULT 1,
+    auth_mode TEXT NOT NULL DEFAULT 'user_pass',
+    http_status TEXT,
     FOREIGN KEY(subscriber_id) REFERENCES subscribers(id) ON DELETE CASCADE
   );
 
@@ -382,6 +385,9 @@ tryAddColumn('notification_settings', "genieacs_pass_enc TEXT NOT NULL DEFAULT '
 tryAddColumn('notification_settings', "radius_host TEXT NOT NULL DEFAULT ''");
 tryAddColumn('notification_settings', 'radius_coa_port INTEGER NOT NULL DEFAULT 3799');
 tryAddColumn('notification_settings', "radius_secret_enc TEXT NOT NULL DEFAULT ''");
+tryAddColumn('cpe_devices', "use_unified INTEGER NOT NULL DEFAULT 1");
+tryAddColumn('cpe_devices', "auth_mode TEXT NOT NULL DEFAULT 'user_pass'");
+tryAddColumn('cpe_devices', "http_status TEXT");
 
 export function getNextTunnelOctet(): number {
   const row = db.prepare('SELECT value FROM app_meta WHERE key = ?').get('next_tunnel_octet') as

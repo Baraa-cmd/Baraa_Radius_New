@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Eye, EyeOff, Lock, Mail, MessageCircle, ShieldCheck, User } from 'lucide-react';
+import { Eye, EyeOff, Lock, Mail, MessageCircle, User } from 'lucide-react';
 import type { AuthUser } from '../types';
 import { BroLogo } from './BroLogo';
 import { PWAInstallButton } from './PWAInstallButton';
@@ -17,7 +17,6 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [supportOpen, setSupportOpen] = useState(false);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -48,31 +47,34 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
   };
 
   return (
-    <div className="min-h-screen bg-[#F4F6FA] dark:bg-[#090B10] flex flex-col">
-      {/* Ocean Cobalt-Teal Header with Ambient Radial Glow */}
-      <div className="relative overflow-hidden bg-gradient-to-b from-[#072B50] via-[#0369A1] to-[#0D9488] pt-14 pb-24 px-6 text-center text-white">
-        <div
-          className="pointer-events-none absolute -top-24 left-1/2 -translate-x-1/2 w-[420px] h-[420px] rounded-full bg-cyan-300/15 blur-3xl"
-          aria-hidden="true"
-        />
-        <div className="relative max-w-md mx-auto flex flex-col items-center">
-          <div className="p-2 rounded-[26px] bg-white/10 backdrop-blur-md border border-white/15 shadow-2xl">
-            <BroLogo size="lg" />
-          </div>
-          <h1 className="mt-5 text-3xl font-extrabold tracking-tight" dir="ltr">
-            Bro Radius
-          </h1>
-          <p className="mt-1.5 text-sm text-sky-100/90 font-medium">
-            منصة مراقبة وإدارة راوترات MikroTik والمشتركين الحقيقية
-          </p>
-        </div>
-      </div>
+    <div className="min-h-screen bg-[#F4F6FA] dark:bg-[#070B14] flex flex-col justify-center py-10 px-4 relative overflow-hidden">
+      {/* Ambient background glows */}
+      <div className="absolute top-1/4 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[600px] rounded-full bg-sky-500/10 blur-[140px] pointer-events-none" />
+      <div className="absolute bottom-10 right-10 w-[400px] h-[400px] rounded-full bg-teal-500/10 blur-[120px] pointer-events-none" />
 
-      {/* Elevated Sheet Card */}
-      <div className="flex-1 px-4 -mt-14 pb-10 relative z-10">
-        <div className="max-w-md mx-auto bg-white dark:bg-[#11151E] border border-slate-200/80 dark:border-white/[0.08] rounded-[28px] p-6 sm:p-8 shadow-2xl shadow-slate-900/10 dark:shadow-black/60">
-          <div className="flex items-center justify-between mb-6">
-            <h2 className="text-xl font-bold text-slate-900 dark:text-white">
+      <div className="max-w-md w-full mx-auto relative z-10 space-y-6">
+        {/* Animated Header & Logo */}
+        <div className="text-center space-y-3">
+          <div className="relative w-20 h-20 mx-auto flex items-center justify-center">
+            <div className="absolute inset-0 rounded-3xl border border-sky-400/40 animate-[spin_10s_linear_infinite]" />
+            <div className="p-2 rounded-[24px] bg-gradient-to-br from-sky-500/20 to-teal-500/20 backdrop-blur-xl border border-white/20 shadow-2xl animate-pulse">
+              <BroLogo size="lg" />
+            </div>
+          </div>
+          <div>
+            <h1 className="text-3xl font-black tracking-wider text-slate-900 dark:text-white" dir="ltr">
+              Bro Radius
+            </h1>
+            <p className="text-xs text-slate-500 dark:text-sky-200/70 font-medium mt-1">
+              منصة إدارة وتوجيه راوترات MikroTik والمشتركين الذكية
+            </p>
+          </div>
+        </div>
+
+        {/* Auth Card */}
+        <div className="bg-white/90 dark:bg-[#111622]/90 backdrop-blur-xl border border-slate-200/80 dark:border-white/[0.08] rounded-[32px] p-7 sm:p-9 shadow-2xl shadow-slate-900/10 dark:shadow-black/70 space-y-6">
+          <div className="flex items-center justify-between">
+            <h2 className="text-xl font-extrabold text-slate-900 dark:text-white">
               {mode === 'login' ? 'تسجيل الدخول' : 'إنشاء حساب شبكة'}
             </h2>
             <button
@@ -104,9 +106,10 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
                 <div>
                   <input
                     type="text"
+                    required
                     value={networkName}
                     onChange={(e) => setNetworkName(e.target.value)}
-                    placeholder="اسم الشبكة أو البرج"
+                    placeholder="اسم الشبكة"
                     className="w-full min-h-[50px] rounded-2xl border border-slate-200 dark:border-white/[0.09] bg-slate-50 dark:bg-[#171C28] px-4 text-sm text-slate-900 dark:text-white placeholder:text-slate-400 focus:outline-none focus:border-sky-500 transition-colors"
                   />
                 </div>
@@ -157,37 +160,27 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
             <button
               type="submit"
               disabled={loading}
-              className="w-full min-h-[50px] rounded-2xl bg-gradient-to-l from-sky-600 to-teal-600 hover:from-sky-500 hover:to-teal-500 text-white font-bold text-sm shadow-lg shadow-sky-900/25 transition-all active:scale-[0.99] disabled:opacity-60"
+              className="w-full min-h-[52px] rounded-2xl bg-gradient-to-l from-sky-600 to-teal-600 hover:from-sky-500 hover:to-teal-500 text-white font-extrabold text-sm shadow-xl shadow-sky-900/30 transition-all active:scale-[0.99] disabled:opacity-60"
             >
-              {loading ? 'جاري التحقق...' : mode === 'login' ? 'دخول' : 'إنشاء الحساب'}
+              {loading ? 'جاري التحقق...' : mode === 'login' ? 'تسجيل الدخول' : 'إنشاء الحساب'}
             </button>
           </form>
 
-          <div className="mt-5 pt-5 border-t border-slate-200/80 dark:border-white/[0.07] space-y-3">
-            <div className="rounded-2xl bg-slate-50 dark:bg-[#171C28] border border-slate-200/80 dark:border-white/[0.06] px-4 py-3 flex items-center gap-3 text-xs text-slate-600 dark:text-slate-300">
-              <ShieldCheck className="w-4 h-4 text-emerald-500 shrink-0" />
-              <span>تشفير AES-256-GCM لبيانات الراوتر واتصال مباشر عبر MikroTik API</span>
-            </div>
+          <div className="pt-4 border-t border-slate-200/80 dark:border-white/[0.07] space-y-3">
+            <a
+              href="https://wa.me/905072415450"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="w-full min-h-[50px] rounded-2xl bg-[#22C55E] hover:bg-[#16A34A] text-white font-extrabold text-sm flex items-center justify-center gap-2.5 shadow-lg shadow-emerald-900/20 transition-colors"
+            >
+              <MessageCircle className="w-5 h-5" />
+              <span>تواصل مع الدعم الفني</span>
+            </a>
 
-            <PWAInstallButton />
+            <div className="flex justify-center">
+              <PWAInstallButton />
+            </div>
           </div>
-        </div>
-
-        <div className="max-w-md mx-auto mt-5 space-y-3">
-          <button
-            type="button"
-            onClick={() => setSupportOpen((prev) => !prev)}
-            className="w-full min-h-[50px] rounded-2xl bg-[#22C55E] hover:bg-[#16A34A] text-white font-bold text-sm flex items-center justify-center gap-2.5 shadow-lg shadow-emerald-900/20 transition-colors"
-          >
-            <MessageCircle className="w-4 h-4" />
-            <span>دليل الربط والدعم الهندسي</span>
-          </button>
-
-          {supportOpen && (
-            <div className="rounded-2xl bg-white dark:bg-[#11151E] border border-slate-200/80 dark:border-white/[0.08] p-4 text-xs text-slate-600 dark:text-slate-300 leading-relaxed text-center">
-              بعد تسجيل الدخول يمكنك إضافة أي راوتر MikroTik وسحب بيانات الهاردوير والمنافذ والمشتركين تلقائياً دون الحاجة لإدخال الموديل يدوياً.
-            </div>
-          )}
         </div>
       </div>
     </div>

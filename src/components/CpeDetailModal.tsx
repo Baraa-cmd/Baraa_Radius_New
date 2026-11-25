@@ -76,6 +76,13 @@ export const CpeDetailModal: React.FC<Props> = ({
   const [cpeHost, setCpeHost] = useState(subscriber.ip || '');
   const [cpePort, setCpePort] = useState('80');
 
+  // CPE Auth & Unified Credentials (for routers without TR-069)
+  const [useUnified, setUseUnified] = useState(true);
+  const [authMode, setAuthMode] = useState<'user_pass' | 'pass_only'>('user_pass');
+  const [cpeUser, setCpeUser] = useState('admin');
+  const [cpePass, setCpePass] = useState('');
+  const [httpFetching, setHttpFetching] = useState(false);
+
   // Wi-Fi 2.4 & 5GHz editor
   const [ssid24, setSsid24] = useState('');
   const [pass24, setPass24] = useState('');
@@ -109,6 +116,9 @@ export const CpeDetailModal: React.FC<Props> = ({
           setChan24(data.cpe.wifiChannel24 || '');
           setSsid5(data.cpe.wifiSsid5 || '');
           setChan5(data.cpe.wifiChannel5 || '');
+          setUseUnified(data.cpe.useUnified !== false);
+          setAuthMode(data.cpe.authMode || 'user_pass');
+          setCpeUser(data.cpe.cpeUser || 'admin');
         }
       }
     } finally {
@@ -140,15 +150,47 @@ export const CpeDetailModal: React.FC<Props> = ({
       setMsg(
         data.cpe?.source === 'genieacs'
           ? 'تم سحب بيانات الراوتر المنزلي الحية عبر TR-069 GenieACS'
-          : 'تم تحليل الأجهزة المتصلة من خلال MikroTik Conntrack واختبار Ping الحي'
+          : data.cpe?.source === 'http_web'
+            ? 'تم جلب بيانات الراوتر من واجهة الويب بنجاح (موديل واسم شبكة الواي فاي)'
+            : 'تم تحليل الأجهزة المتصلة من خلال MikroTik Conntrack واختبار Ping الحي'
       );
     } finally {
       setSyncing(false);
     }
   };
 
-  const handleSaveMapping = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const handleFetchHttpData = async () => {
+    setHttpFetching(true);
+    setErr(null);
+    setMsg(null);
+    try {
+      const res = await fetch(`/api/subscribers/${subscriber.id}/cpe/http-fetch`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setErr(data.error || 'فشل جلب بيانات الراوتر عبر HTTP');
+        return;
+      }
+      setCpe(data.cpe);
+      if (data.probe?.model || data.probe?.wifiSsid24) {
+        setMsg(
+          data.probe.message ||
+            `تم جلب بيانات الراوتر بنجاح: ${data.probe.model || 'معروف'} · شبكة الواي فاي: ${data.probe.wifiSsid24 || '—'}`
+        );
+      } else {
+        setMsg(data.probe?.message || 'تم فحص استجابة واجهة ويب الراوتر');
+      }
+    } catch {
+      setErr('تعذر الاتصال بصفحة الراوتر عبر المنفذ المحدد');
+    } finally {
+      setHttpFetching(false);
+    }
+  };
+
+  const handleSaveMapping = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
     setErr(null);
     const res = await fetch(`/api/subscribers/${subscriber.id}/cpe/config`, {
       method: 'PATCH',
@@ -160,12 +202,16 @@ export const CpeDetailModal: React.FC<Props> = ({
         tr069DeviceId: tr069Id,
         cpeHost,
         cpePort: Number(cpePort) || 80,
+        cpeUser: cpeUser.trim() || undefined,
+        cpePass: cpePass.trim() || undefined,
+        useUnified,
+        authMode,
       }),
     });
     const data = await res.json();
     if (res.ok) {
       setCpe(data.cpe);
-      setMsg('تم حفظ معرف TR-069 / منفذ الواجهة');
+      setMsg('تم حفظ إعدادات راوتر المشترك بنجاح');
     } else {
       setErr(data.error || 'تعذر الحفظ');
     }
@@ -268,12 +314,22 @@ export const CpeDetailModal: React.FC<Props> = ({
           <div className="flex items-center gap-2">
             <button
               type="button"
+              onClick={() => void handleFetchHttpData()}
+              disabled={httpFetching}
+              title="جلب موديل الراوتر واسم شبكة الواي فاي مباشرة عبر HTTP للراوترات بدون TR-069"
+              className="min-h-[38px] px-3 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold inline-flex items-center gap-1.5 disabled:opacity-60"
+            >
+              <Globe className={`w-3.5 h-3.5 ${httpFetching ? 'animate-spin' : ''}`} />
+              <span>{httpFetching ? 'جاري الجلب...' : 'جلب بيانات الراوتر (HTTP)'}</span>
+            </button>
+            <button
+              type="button"
               onClick={() => void handleSyncCpe()}
               disabled={syncing}
               className="min-h-[38px] px-3 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-xs font-bold inline-flex items-center gap-1.5"
             >
               <RefreshCw className={`w-3.5 h-3.5 ${syncing ? 'animate-spin' : ''}`} />
-              <span>فحص الآن (CPE + Ping)</span>
+              <span>فحص الآن</span>
             </button>
             <button
               type="button"
@@ -292,17 +348,34 @@ export const CpeDetailModal: React.FC<Props> = ({
             <div className="text-base font-extrabold font-mono text-sky-500 mt-0.5" dir="ltr">
               {cpe?.connectedCount ?? 0} جهاز
             </div>
+            {cpe?.wifiSsid24 && (
+              <div className="text-[10px] text-sky-600 dark:text-sky-400 font-mono truncate mt-0.5" dir="ltr">
+                Wi-Fi: {cpe.wifiSsid24}
+              </div>
+            )}
           </div>
           <div className="rounded-xl bg-slate-50 dark:bg-[#171C28] p-3">
             <div className="text-[11px] text-slate-500">موديل الراوتر المنزلي</div>
             <div className="font-bold text-slate-900 dark:text-white truncate mt-0.5">
               {cpe?.model || 'اضغط فحص الآن'}
             </div>
+            <div className="text-[10px] text-slate-500 truncate mt-0.5">
+              {cpe?.source === 'genieacs'
+                ? 'TR-069 GenieACS'
+                : cpe?.source === 'http_web'
+                  ? 'جلب مباشر (HTTP Web)'
+                  : cpe?.source === 'mikrotik_conntrack'
+                    ? 'MikroTik Conntrack'
+                    : 'غير مفحوص'}
+            </div>
           </div>
           <div className="rounded-xl bg-slate-50 dark:bg-[#171C28] p-3">
-            <div className="text-[11px] text-slate-500">CPU / RAM / تشغيل</div>
-            <div className="font-mono font-bold text-slate-900 dark:text-white mt-0.5" dir="ltr">
-              {cpe?.cpuPct ?? '—'}% · {cpe?.ramPct ?? '—'}%
+            <div className="text-[11px] text-slate-500">حالة الاتصال والويب</div>
+            <div className="font-mono font-bold text-slate-900 dark:text-white truncate mt-0.5" dir="ltr">
+              {cpe?.httpStatus || (cpe?.cpuPct ? `CPU ${cpe.cpuPct}%` : 'HTTP Port ' + (cpe?.cpePort || 80))}
+            </div>
+            <div className="text-[10px] text-slate-500 mt-0.5">
+              {cpe?.useUnified !== false ? 'كلمة موحدة' : 'بيانات خاصة'}
             </div>
           </div>
           <div className="rounded-xl bg-slate-50 dark:bg-[#171C28] p-3">
@@ -438,6 +511,138 @@ export const CpeDetailModal: React.FC<Props> = ({
           </div>
         ) : tab === 'wifi' ? (
           <div className="space-y-4">
+            {/* Direct HTTP Web Fetch & Unified Credentials for Routers without TR-069 */}
+            <div className="rounded-2xl bg-slate-50 dark:bg-[#171C28] border border-slate-200/80 dark:border-white/[0.07] p-4 space-y-3.5 text-xs">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="font-bold text-slate-900 dark:text-white flex items-center gap-1.5">
+                  <Globe className="w-4 h-4 text-sky-500" />
+                  <span>طريقة دخول الراوتر وجلب البيانات (HTTP Web) — لراوترات بدون TR-069</span>
+                </div>
+                <span className="text-[11px] px-2 py-0.5 rounded-md font-bold bg-sky-500/15 text-sky-500">
+                  {cpe?.source === 'http_web' ? 'قراءة مباشرة من الويب' : 'يدعم Tenda / TP-Link / Mercusys'}
+                </span>
+              </div>
+
+              <p className="text-[11px] text-slate-500 dark:text-slate-400 leading-relaxed">
+                لكثير من الراوترات التي لا تدعم بروتوكول TR-069: يمكنك جلب الموديل، الفيرموير، واسم شبكة الواي فاي (SSID) تلقائياً عبر واجهة الويب مباشرة، باستخدام كلمة المرور الموحدة أو بيانات مخصصة.
+              </p>
+
+              {/* Unified vs Custom Switch */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 bg-white dark:bg-[#11151E] p-2.5 rounded-xl border border-slate-200 dark:border-white/[0.08]">
+                <label className="flex items-center gap-2 font-bold text-slate-800 dark:text-slate-200 cursor-pointer text-xs p-1">
+                  <input
+                    type="radio"
+                    name="cpeUnifiedRadio"
+                    checked={useUnified}
+                    onChange={() => setUseUnified(true)}
+                    className="accent-sky-500"
+                  />
+                  <span>استخدام كلمة المرور الموحدة للشبكة</span>
+                </label>
+                <label className="flex items-center gap-2 font-bold text-slate-800 dark:text-slate-200 cursor-pointer text-xs p-1">
+                  <input
+                    type="radio"
+                    name="cpeUnifiedRadio"
+                    checked={!useUnified}
+                    onChange={() => setUseUnified(false)}
+                    className="accent-sky-500"
+                  />
+                  <span>بيانات دخول مخصصة لهذا الراوتر</span>
+                </label>
+              </div>
+
+              {/* Auth Mode Toggle & Custom Credential Inputs */}
+              <div className="space-y-2.5">
+                <div className="flex flex-wrap items-center gap-2 text-[11px] font-bold text-slate-600 dark:text-slate-300">
+                  <span>نوع تسجيل الدخول للراوتر:</span>
+                  <div className="inline-flex rounded-lg border border-slate-200 dark:border-white/[0.1] p-0.5 bg-white dark:bg-[#11151E]">
+                    <button
+                      type="button"
+                      onClick={() => setAuthMode('user_pass')}
+                      className={`px-2.5 py-1 rounded-md text-xs font-bold transition-colors ${
+                        authMode === 'user_pass'
+                          ? 'bg-sky-600 text-white'
+                          : 'text-slate-500 hover:text-slate-800 dark:hover:text-white'
+                      }`}
+                    >
+                      اسم مستخدم وكلمة مرور
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setAuthMode('pass_only')}
+                      className={`px-2.5 py-1 rounded-md text-xs font-bold transition-colors ${
+                        authMode === 'pass_only'
+                          ? 'bg-sky-600 text-white'
+                          : 'text-slate-500 hover:text-slate-800 dark:hover:text-white'
+                      }`}
+                    >
+                      كلمة مرور فقط (Tenda / TP-Link / Mercusys)
+                    </button>
+                  </div>
+                </div>
+
+                {!useUnified && (
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                    {authMode === 'user_pass' && (
+                      <input
+                        type="text"
+                        dir="ltr"
+                        value={cpeUser}
+                        onChange={(e) => setCpeUser(e.target.value)}
+                        placeholder="اسم المستخدم (admin)"
+                        className="min-h-[38px] rounded-xl border border-slate-200 dark:border-white/[0.1] bg-white dark:bg-[#11151E] px-2.5 font-mono text-slate-900 dark:text-white"
+                      />
+                    )}
+                    <input
+                      type="password"
+                      dir="ltr"
+                      value={cpePass}
+                      onChange={(e) => setCpePass(e.target.value)}
+                      placeholder={authMode === 'pass_only' ? 'كلمة مرور الراوتر فقط' : 'كلمة المرور'}
+                      className="min-h-[38px] rounded-xl border border-slate-200 dark:border-white/[0.1] bg-white dark:bg-[#11151E] px-2.5 font-mono text-slate-900 dark:text-white"
+                    />
+                    <input
+                      type="number"
+                      dir="ltr"
+                      value={cpePort}
+                      onChange={(e) => setCpePort(e.target.value)}
+                      placeholder="منفذ الويب (80)"
+                      className="min-h-[38px] rounded-xl border border-slate-200 dark:border-white/[0.1] bg-white dark:bg-[#11151E] px-2.5 font-mono text-slate-900 dark:text-white"
+                    />
+                  </div>
+                )}
+              </div>
+
+              {/* Action Buttons & Status */}
+              <div className="flex flex-wrap items-center gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={() => void handleFetchHttpData()}
+                  disabled={httpFetching}
+                  className="min-h-[38px] px-4 rounded-xl bg-sky-600 hover:bg-sky-500 text-white font-bold inline-flex items-center gap-1.5 disabled:opacity-60"
+                >
+                  <Globe className={`w-3.5 h-3.5 ${httpFetching ? 'animate-spin' : ''}`} />
+                  <span>{httpFetching ? 'جاري جلب البيانات من الراوتر...' : 'جلب بيانات الراوتر الآن (HTTP Web)'}</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={(e) => void handleSaveMapping(e)}
+                  className="min-h-[38px] px-3.5 rounded-xl border border-slate-200 dark:border-white/[0.1] bg-white dark:bg-[#11151E] font-bold inline-flex items-center gap-1.5"
+                >
+                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500" />
+                  <span>حفظ إعدادات الدخول</span>
+                </button>
+
+                {cpe?.httpStatus && (
+                  <span className="text-[11px] font-mono text-slate-600 dark:text-slate-300 bg-white dark:bg-[#11151E] px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-white/[0.08]" dir="ltr">
+                    {cpe.httpStatus}
+                  </span>
+                )}
+              </div>
+            </div>
+
+            {/* TR-069 Wi-Fi Push */}
             <form onSubmit={(e) => void handlePushWifi(e)} className="rounded-2xl bg-slate-50 dark:bg-[#171C28] p-4 space-y-3 text-xs">
               <div className="font-bold text-slate-900 dark:text-white flex items-center gap-1.5">
                 <Wifi className="w-4 h-4 text-sky-500" />
@@ -536,6 +741,7 @@ export const CpeDetailModal: React.FC<Props> = ({
               </div>
             </form>
 
+            {/* TR-069 Device ID & Host mapping */}
             <form onSubmit={(e) => void handleSaveMapping(e)} className="rounded-2xl border border-slate-200/80 dark:border-white/[0.07] p-4 grid grid-cols-1 sm:grid-cols-4 gap-2 text-xs">
               <input
                 type="text"

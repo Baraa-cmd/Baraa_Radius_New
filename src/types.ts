@@ -426,12 +426,23 @@ export interface CpeConnectedHost {
   blocked?: boolean;
 }
 
+export interface UnifiedCpeCredentials {
+  enabled: boolean;
+  authMode: 'user_pass' | 'pass_only';
+  username: string;
+  hasPassword?: boolean;
+  defaultPort: number;
+}
+
 export interface CpeDeviceInfo {
   subscriberId: string;
-  source: 'genieacs' | 'mikrotik_conntrack' | 'unconfigured';
+  source: 'genieacs' | 'mikrotik_conntrack' | 'http_web' | 'unconfigured';
   tr069DeviceId: string | null;
   cpeHost: string | null;
   cpePort: number;
+  cpeUser?: string;
+  authMode?: 'user_pass' | 'pass_only';
+  useUnified?: boolean;
   model: string | null;
   serialNumber: string | null;
   firmware: string | null;
@@ -449,6 +460,7 @@ export interface CpeDeviceInfo {
   tr143UpMbps: number | null;
   lastSyncedAt: string | null;
   hasConfigBackup: boolean;
+  httpStatus?: string | null;
 }
 
 export interface SubscriberSessionRecord {

@@ -502,3 +502,275 @@ export async function proxyCpeHttpPage(params: {
     req.end();
   });
 }
+
+// ============================================================================
+// Direct Non-TR-069 CPE Router HTTP Scraper & Probe
+// Supports both 'user_pass' (admin/password) and 'pass_only' (Tenda, TP-Link, Mercusys)
+// ============================================================================
+export interface CpeHttpProbeResult {
+  success: boolean;
+  model: string | null;
+  vendor: string | null;
+  firmware: string | null;
+  wifiSsid24: string | null;
+  wifiChannel24: string | null;
+  uptimeSec: number | null;
+  authStatus: 'authorized' | 'auth_failed' | 'no_auth_needed' | 'unreachable';
+  message: string;
+}
+
+export async function probeAndFetchCpeHttpData(params: {
+  host: string;
+  port?: number;
+  authMode?: 'user_pass' | 'pass_only';
+  username?: string;
+  password?: string;
+  subMac?: string;
+  timeoutMs?: number;
+}): Promise<CpeHttpProbeResult> {
+  const {
+    host,
+    port = 80,
+    authMode = 'user_pass',
+    username = 'admin',
+    password = '',
+    subMac = '',
+    timeoutMs = 4500,
+  } = params;
+
+  let safeHost: string;
+  try {
+    safeHost = assertSafeDeviceHost(host);
+  } catch (err) {
+    return {
+      success: false,
+      model: null,
+      vendor: null,
+      firmware: null,
+      wifiSsid24: null,
+      wifiChannel24: null,
+      uptimeSec: null,
+      authStatus: 'unreachable',
+      message: err instanceof Error ? err.message : 'عنوان IP غير صالح',
+    };
+  }
+
+  const effectiveUser = authMode === 'pass_only' ? (username || 'admin') : (username || 'admin');
+  const authHeader = password
+    ? `Basic ${Buffer.from(`${effectiveUser}:${password}`).toString('base64')}`
+    : undefined;
+
+  const macVendor = subMac ? lookupMacVendor(subMac) : 'Unknown';
+
+  const makeReq = (path: string, extraHeaders: Record<string, string> = {}): Promise<{
+    statusCode: number;
+    headers: http.IncomingHttpHeaders;
+    body: string;
+  }> => {
+    return new Promise((resolve, reject) => {
+      const isHttps = port === 443 || port === 8443;
+      const mod = isHttps ? https : http;
+      const req = mod.request(
+        {
+          hostname: safeHost,
+          port,
+          path,
+          method: 'GET',
+          timeout: timeoutMs,
+          rejectUnauthorized: false,
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) BroRadius/1.0',
+            Accept: 'text/html,application/xhtml+xml,application/json,*/*',
+            ...(authHeader ? { Authorization: authHeader } : {}),
+            ...extraHeaders,
+          },
+        },
+        (res) => {
+          const chunks: Buffer[] = [];
+          let total = 0;
+          res.on('data', (c: Buffer) => {
+            total += c.length;
+            if (total <= 512 * 1024) chunks.push(c);
+          });
+          res.on('end', () => {
+            resolve({
+              statusCode: res.statusCode || 200,
+              headers: res.headers,
+              body: Buffer.concat(chunks).toString('utf8'),
+            });
+          });
+        }
+      );
+      req.on('timeout', () => req.destroy(new Error('timeout')));
+      req.on('error', reject);
+      req.end();
+    });
+  };
+
+  try {
+    // Probe 1: Root / login page
+    const rootRes = await makeReq('/').catch(() => null);
+
+    // If unreachable on root, attempt /login.html
+    const res = rootRes || (await makeReq('/login.html').catch(() => null));
+    if (!res) {
+      return {
+        success: false,
+        model: macVendor !== 'Unknown' ? `${macVendor} (غير متصل)` : null,
+        vendor: macVendor !== 'Unknown' ? macVendor : null,
+        firmware: null,
+        wifiSsid24: null,
+        wifiChannel24: null,
+        uptimeSec: null,
+        authStatus: 'unreachable',
+        message: 'تعذر الاتصال بواجهة الراوتر المنزلي (تأكد من تفعيل Remote Management)',
+      };
+    }
+
+    const body = res.body;
+    const serverHeader = String(res.headers['server'] || '');
+    const authHeaderResp = String(res.headers['www-authenticate'] || '');
+
+    // Extract Title / Model
+    const titleMatch = body.match(/<title[^>]*>([^<]+)<\/title>/i);
+    let rawTitle = titleMatch ? titleMatch[1].trim() : '';
+    // Clean up generic words
+    rawTitle = rawTitle.replace(/\s*[-|_|–]\s*(Login|Sign in|Home|Status|Main)$/i, '').trim();
+
+    // Check specific vendors
+    let detectedVendor = macVendor !== 'Unknown' ? macVendor : '';
+    let detectedModel = rawTitle || null;
+    let firmware: string | null = null;
+    let wifiSsid: string | null = null;
+    let wifiChan: string | null = null;
+    let uptimeSec: number | null = null;
+
+    if (/tenda/i.test(body) || /tenda/i.test(serverHeader) || /tenda/i.test(macVendor)) {
+      detectedVendor = 'Tenda';
+      if (!detectedModel || detectedModel === 'Tenda' || /login/i.test(detectedModel)) {
+        const m = body.match(/\b(AC\d+|F\d+|N\d+|Nova|W\d+)\b/i);
+        detectedModel = m ? `Tenda ${m[1]}` : 'Tenda Wireless Router';
+      }
+      // Try Tenda status API
+      try {
+        const tendaStat = await makeReq('/goform/GetSysInfo', { Accept: 'application/json' });
+        if (tendaStat.statusCode === 200 && tendaStat.body.includes('{')) {
+          const json = JSON.parse(tendaStat.body);
+          if (json.version) firmware = String(json.version);
+          if (json.ssid) wifiSsid = String(json.ssid);
+          if (json.channel) wifiChan = String(json.channel);
+          if (json.uptime) uptimeSec = Number(json.uptime) || null;
+        }
+      } catch {
+        // Ignore Tenda secondary API error
+      }
+    } else if (/tp-link|tplink/i.test(body) || /tp-link/i.test(authHeaderResp) || /tp-link/i.test(macVendor)) {
+      detectedVendor = 'TP-Link';
+      if (!detectedModel || /tp-link/i.test(detectedModel)) {
+        const m = body.match(/\b(TL-[A-Z0-9]+|Archer\s+[A-Z0-9]+|Deco\s+[A-Z0-9]+)\b/i);
+        detectedModel = m ? `TP-Link ${m[1]}` : (rawTitle || 'TP-Link Wireless Router');
+      }
+      // Try TP-Link Status page
+      try {
+        const tpStat = await makeReq('/userRpm/StatusRpm.htm');
+        if (tpStat.statusCode === 200 && tpStat.body.includes('statusPara')) {
+          const ssidMatch = tpStat.body.match(/["']([a-zA-Z0-9_\-\s]+)["'],\s*\d+,\s*\d+,\s*["'][0-9a-f:]+["']/i);
+          if (ssidMatch) wifiSsid = ssidMatch[1];
+          const verMatch = tpStat.body.match(/["'](\d+\.\d+\.\d+[^"']*)["']/);
+          if (verMatch) firmware = verMatch[1];
+        }
+      } catch {
+        // Ignore TP-Link secondary API error
+      }
+    } else if (/mercusys/i.test(body) || /mercusys/i.test(macVendor)) {
+      detectedVendor = 'Mercusys';
+      const m = body.match(/\b(MW\d+[A-Z]*|AC\d+)\b/i);
+      detectedModel = m ? `Mercusys ${m[1]}` : (rawTitle || 'Mercusys Wireless Router');
+    } else if (/xiaomi|miwifi/i.test(body) || /xiaomi/i.test(macVendor)) {
+      detectedVendor = 'Xiaomi';
+      detectedModel = rawTitle || 'Mi WiFi Router';
+    } else if (/mikrotik/i.test(body) || /routeros/i.test(body)) {
+      detectedVendor = 'MikroTik';
+      detectedModel = rawTitle || 'MikroTik RouterOS CPE';
+    } else if (/totolink/i.test(body) || /totolink/i.test(macVendor)) {
+      detectedVendor = 'Totolink';
+      detectedModel = rawTitle || 'Totolink Wireless Router';
+    } else if (/huawei/i.test(body) || /huawei/i.test(macVendor)) {
+      detectedVendor = 'Huawei';
+      detectedModel = rawTitle || 'Huawei Home Gateway';
+    } else if (/zte/i.test(body) || /zte/i.test(macVendor)) {
+      detectedVendor = 'ZTE';
+      detectedModel = rawTitle || 'ZTE Home Gateway';
+    }
+
+    // Generic SSID and Firmware regex extraction from HTML if not parsed yet
+    if (!wifiSsid) {
+      const s = body.match(/(?:ssid|wlan_ssid|def_ssid|wireless_ssid)\s*[:=]\s*["']([^"']{2,32})["']/i);
+      if (s && !/null|undefined|default/i.test(s[1])) wifiSsid = s[1];
+    }
+    if (!firmware) {
+      const f = body.match(/(?:firmware|software|build_version)\s*[:=]\s*["']([^"']{3,24})["']/i);
+      if (f) firmware = f[1];
+    }
+
+    // Authentication evaluation
+    if (res.statusCode === 401) {
+      return {
+        success: true,
+        model: detectedModel || (detectedVendor ? `${detectedVendor} Home CPE` : 'Home Router'),
+        vendor: detectedVendor || null,
+        firmware,
+        wifiSsid24: wifiSsid,
+        wifiChannel24: wifiChan,
+        uptimeSec,
+        authStatus: 'auth_failed',
+        message: 'تم الوصول للراوتر ولكن كلمة المرور غير متطابقة (HTTP 401) — يرجى التأكد من كلمة المرور',
+      };
+    }
+
+    if (res.statusCode === 200 || res.statusCode === 302) {
+      const hasAuth = Boolean(password);
+      return {
+        success: true,
+        model: detectedModel || (detectedVendor ? `${detectedVendor} Home CPE` : 'Home Router'),
+        vendor: detectedVendor || null,
+        firmware,
+        wifiSsid24: wifiSsid,
+        wifiChannel24: wifiChan,
+        uptimeSec,
+        authStatus: hasAuth ? 'authorized' : 'no_auth_needed',
+        message: hasAuth
+          ? `تم الاتصال بالراوتر بنجاح (${detectedModel || detectedVendor || 'Home CPE'})`
+          : 'واجهة الراوتر متاحة بدون حماية أو بانتظار إدخال كلمة المرور',
+      };
+    }
+
+    return {
+      success: true,
+      model: detectedModel || 'Home Router',
+      vendor: detectedVendor || null,
+      firmware,
+      wifiSsid24: wifiSsid,
+      wifiChannel24: wifiChan,
+      uptimeSec,
+      authStatus: 'no_auth_needed',
+      message: `استجاب الراوتر برمز HTTP ${res.statusCode}`,
+    };
+  } catch (err: any) {
+    const isConnRefused = err?.code === 'ECONNREFUSED';
+    return {
+      success: false,
+      model: null,
+      vendor: null,
+      firmware: null,
+      wifiSsid24: null,
+      wifiChannel24: null,
+      uptimeSec: null,
+      authStatus: 'unreachable',
+      message: isConnRefused
+        ? 'تم رفض الاتصال بالمنفذ — تأكد من أن منفذ إدارة الويب (80 أو 8080) مفتوح على راوتر المشترك'
+        : 'انتهت مهلة الاتصال براوتر المشترك (الجهاز قد يكون مغلقاً أو خلف جدار ناري)',
+    };
+  }
+}
+
