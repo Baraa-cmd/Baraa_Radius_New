@@ -1,25 +1,40 @@
 import path from 'path';
+import fs from 'fs';
 import { DatabaseSync } from 'node:sqlite';
 
 const DB_PATH = process.env.BRO_RADIUS_DB_PATH || path.resolve(process.cwd(), 'bro-radius.db');
 
-export const db = new DatabaseSync(DB_PATH);
+let dbInstance: DatabaseSync;
+try {
+  dbInstance = new DatabaseSync(DB_PATH);
+} catch (err) {
+  console.error('Database open error, checking corruption:', err);
+  if (fs.existsSync(DB_PATH)) {
+    const backupPath = `${DB_PATH}.corrupt.${Date.now()}`;
+    fs.renameSync(DB_PATH, backupPath);
+    console.warn(`Backed up malformed database to ${backupPath}`);
+  }
+  dbInstance = new DatabaseSync(DB_PATH);
+}
 
-db.exec(`
-  PRAGMA journal_mode = WAL;
-  PRAGMA foreign_keys = ON;
+export const db = dbInstance;
 
-  CREATE TABLE IF NOT EXISTS users (
-    id TEXT PRIMARY KEY,
-    owner_id TEXT NOT NULL,
-    name TEXT NOT NULL,
-    email TEXT UNIQUE NOT NULL,
-    network_name TEXT NOT NULL,
-    role TEXT NOT NULL DEFAULT 'admin',
-    password_hash TEXT NOT NULL,
-    salt TEXT NOT NULL,
-    created_at TEXT NOT NULL
-  );
+try {
+  db.exec(`
+    PRAGMA journal_mode = WAL;
+    PRAGMA foreign_keys = ON;
+
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      owner_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      email TEXT UNIQUE NOT NULL,
+      network_name TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'admin',
+      password_hash TEXT NOT NULL,
+      salt TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
 
   CREATE TABLE IF NOT EXISTS routers (
     id TEXT PRIMARY KEY,
@@ -356,6 +371,13 @@ db.exec(`
     FOREIGN KEY(router_id) REFERENCES routers(id) ON DELETE CASCADE
   );
 `);
+} catch (err) {
+  console.error('Database schema init error:', err);
+  if (fs.existsSync(DB_PATH)) {
+    const backupPath = `${DB_PATH}.corrupt.${Date.now()}`;
+    fs.renameSync(DB_PATH, backupPath);
+  }
+}
 
 function tryAddColumn(table: string, colDef: string): void {
   try {
