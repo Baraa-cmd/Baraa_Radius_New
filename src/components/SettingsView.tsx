@@ -26,6 +26,7 @@ import type {
   ServerCapabilities,
   TeamMember,
   ThemeMode,
+  TowerNode,
   UserRole,
   VpsRelayStatus,
 } from '../types';
@@ -35,6 +36,7 @@ interface SettingsViewProps {
   token: string;
   user: AuthUser;
   theme: ThemeMode;
+  towers?: TowerNode[];
   onToggleTheme: () => void;
   alerts: RouterAlertItem[];
   onAckAlert: (alertId: string) => void;
@@ -53,6 +55,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   token,
   user,
   theme,
+  towers = [],
   onToggleTheme,
   alerts,
   onAckAlert,
@@ -65,8 +68,23 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     telegramChatId: '',
     hasTelegramToken: false,
     dailyDigestEnabled: true,
+    turboNightEnabled: false,
+    turboStartHour: 1,
+    turboEndHour: 7,
+    turboDefaultProfile: '',
+    genieacsUrl: '',
+    genieacsUser: '',
+    hasGenieacsPass: false,
+    radiusHost: '',
+    radiusCoaPort: 3799,
+    hasRadiusSecret: false,
   });
   const [tgTokenInput, setTgTokenInput] = useState('');
+  const [geniePassInput, setGeniePassInput] = useState('');
+  const [radiusSecretInput, setRadiusSecretInput] = useState('');
+  const [httpsDomainInput, setHttpsDomainInput] = useState('');
+  const [httpsCopied, setHttpsCopied] = useState(false);
+
   const [teamMembers, setTeamMembers] = useState<TeamMember[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>([]);
   const [digest, setDigest] = useState<{
@@ -81,6 +99,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [newEmail, setNewEmail] = useState('');
   const [newPass, setNewPass] = useState('');
   const [newRole, setNewRole] = useState<UserRole>('technician');
+  const [newAllowedTowers, setNewAllowedTowers] = useState<string[]>([]);
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
   const [capabilities, setCapabilities] = useState<ServerCapabilities | null>(null);
   const [vpsStatus, setVpsStatus] = useState<VpsRelayStatus | null>(null);
@@ -197,12 +216,44 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     }
   };
 
+  const handleSaveAdvancedIntegrations = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const res = await fetch('/api/settings/notifications', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        turboNightEnabled: Boolean(notif.turboNightEnabled),
+        turboStartHour: Number(notif.turboStartHour ?? 1),
+        turboEndHour: Number(notif.turboEndHour ?? 7),
+        turboDefaultProfile: notif.turboDefaultProfile || '',
+        genieacsUrl: notif.genieacsUrl || '',
+        genieacsUser: notif.genieacsUser || '',
+        genieacsPass: geniePassInput.trim() || undefined,
+        radiusHost: notif.radiusHost || '',
+        radiusCoaPort: Number(notif.radiusCoaPort ?? 3799),
+        radiusSecret: radiusSecretInput.trim() || undefined,
+      }),
+    });
+    if (res.ok) {
+      setGeniePassInput('');
+      setRadiusSecretInput('');
+      setStatusMsg('تم حفظ إعدادات GenieACS (TR-069) و RADIUS CoA وجدول التوربو الليلي');
+      void loadSettings();
+    }
+  };
+
   const handleAddMember = async (e: React.FormEvent) => {
     e.preventDefault();
     const res = await fetch('/api/team', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ name: newName, email: newEmail, password: newPass, role: newRole }),
+      body: JSON.stringify({
+        name: newName,
+        email: newEmail,
+        password: newPass,
+        role: newRole,
+        allowedTowerIds: newAllowedTowers,
+      }),
     });
     const data = await res.json();
     if (!res.ok) {
@@ -212,8 +263,24 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     setNewName('');
     setNewEmail('');
     setNewPass('');
-    setStatusMsg('تمت إضافة عضو الفريق');
+    setNewAllowedTowers([]);
+    setStatusMsg('تمت إضافة عضو الفريق بصلاحيات الأبراج المحددة');
     void loadSettings();
+  };
+
+  const handleToggleMemberTower = async (member: TeamMember, towerId: string) => {
+    const cur = member.allowedTowerIds || [];
+    const next = cur.includes(towerId) ? cur.filter((id) => id !== towerId) : [...cur, towerId];
+    const res = await fetch(`/api/team/${member.id}/towers`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ allowedTowerIds: next }),
+    });
+    if (res.ok) {
+      setTeamMembers((prev) =>
+        prev.map((m) => (m.id === member.id ? { ...m, allowedTowerIds: next } : m))
+      );
+    }
   };
 
   const handleDeleteMember = async (id: string) => {
@@ -550,78 +617,268 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         )}
       </div>
 
-      {/* Team RBAC Management (#84) */}
+      {/* Advanced Integrations: GenieACS TR-069 (#18), RADIUS CoA (#46), Night Turbo (#54) */}
+      {user.role === 'admin' && (
+        <form
+          onSubmit={(e) => void handleSaveAdvancedIntegrations(e)}
+          className="rounded-[22px] bg-white dark:bg-[#11151E] border border-slate-200/80 dark:border-white/[0.07] p-5 space-y-4"
+        >
+          <div className="flex items-center gap-2 text-sm font-bold text-slate-900 dark:text-white">
+            <Server className="w-4 h-4 text-indigo-500" />
+            <span>الربط المتقدم: GenieACS (TR-069) + RADIUS CoA + التوربو الليلي</span>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+            <div>
+              <label className="block text-[11px] font-bold text-slate-500 mb-1">رابط خادم GenieACS NBI</label>
+              <input
+                type="url"
+                dir="ltr"
+                value={notif.genieacsUrl || ''}
+                onChange={(e) => setNotif((p) => ({ ...p, genieacsUrl: e.target.value }))}
+                placeholder="http://127.0.0.1:7557"
+                className="w-full min-h-[42px] rounded-xl border border-slate-200 dark:border-white/[0.09] bg-slate-50 dark:bg-[#171C28] px-3 font-mono text-slate-900 dark:text-white"
+              />
+            </div>
+            <div>
+              <label className="block text-[11px] font-bold text-slate-500 mb-1">مستخدم GenieACS</label>
+              <input
+                type="text"
+                dir="ltr"
+                value={notif.genieacsUser || ''}
+                onChange={(e) => setNotif((p) => ({ ...p, genieacsUser: e.target.value }))}
+                placeholder="اختياري"
+                className="w-full min-h-[42px] rounded-xl border border-slate-200 dark:border-white/[0.09] bg-slate-50 dark:bg-[#171C28] px-3 font-mono text-slate-900 dark:text-white"
+              />
+            </div>
+            <div>
+              <label className="block text-[11px] font-bold text-slate-500 mb-1">كلمة مرور GenieACS</label>
+              <input
+                type="password"
+                dir="ltr"
+                value={geniePassInput}
+                onChange={(e) => setGeniePassInput(e.target.value)}
+                placeholder={notif.hasGenieacsPass ? 'محفوظ (اكتب للتحديث)' : 'اختياري'}
+                className="w-full min-h-[42px] rounded-xl border border-slate-200 dark:border-white/[0.09] bg-slate-50 dark:bg-[#171C28] px-3 font-mono text-slate-900 dark:text-white"
+              />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs pt-2 border-t border-slate-100 dark:border-white/[0.06]">
+            <div>
+              <label className="block text-[11px] font-bold text-slate-500 mb-1">خادم RADIUS CoA Host</label>
+              <input
+                type="text"
+                dir="ltr"
+                value={notif.radiusHost || ''}
+                onChange={(e) => setNotif((p) => ({ ...p, radiusHost: e.target.value }))}
+                placeholder="IP السيرفر أو NAS"
+                className="w-full min-h-[42px] rounded-xl border border-slate-200 dark:border-white/[0.09] bg-slate-50 dark:bg-[#171C28] px-3 font-mono text-slate-900 dark:text-white"
+              />
+            </div>
+            <div>
+              <label className="block text-[11px] font-bold text-slate-500 mb-1">منفذ CoA (RFC 5176)</label>
+              <input
+                type="number"
+                dir="ltr"
+                value={notif.radiusCoaPort ?? 3799}
+                onChange={(e) => setNotif((p) => ({ ...p, radiusCoaPort: Number(e.target.value) || 3799 }))}
+                className="w-full min-h-[42px] rounded-xl border border-slate-200 dark:border-white/[0.09] bg-slate-50 dark:bg-[#171C28] px-3 font-mono text-slate-900 dark:text-white"
+              />
+            </div>
+            <div>
+              <label className="block text-[11px] font-bold text-slate-500 mb-1">RADIUS Shared Secret</label>
+              <input
+                type="password"
+                dir="ltr"
+                value={radiusSecretInput}
+                onChange={(e) => setRadiusSecretInput(e.target.value)}
+                placeholder={notif.hasRadiusSecret ? 'محفوظ (اكتب للتحديث)' : 'Secret'}
+                className="w-full min-h-[42px] rounded-xl border border-slate-200 dark:border-white/[0.09] bg-slate-50 dark:bg-[#171C28] px-3 font-mono text-slate-900 dark:text-white"
+              />
+            </div>
+          </div>
+
+          <div className="rounded-2xl bg-slate-50 dark:bg-[#171C28] p-3.5 space-y-3 text-xs">
+            <label className="flex items-center justify-between font-bold text-slate-800 dark:text-slate-200">
+              <span>تفعيل مضاعفة السرعة الليلية التلقائية (Night Turbo)</span>
+              <input
+                type="checkbox"
+                checked={Boolean(notif.turboNightEnabled)}
+                onChange={(e) => setNotif((p) => ({ ...p, turboNightEnabled: e.target.checked }))}
+                className="w-4 h-4 accent-indigo-500"
+              />
+            </label>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+              <div>
+                <label className="block text-[11px] text-slate-500 mb-1">ساعة البدء (0-23)</label>
+                <input
+                  type="number"
+                  min={0}
+                  max={23}
+                  dir="ltr"
+                  value={notif.turboStartHour ?? 1}
+                  onChange={(e) => setNotif((p) => ({ ...p, turboStartHour: Number(e.target.value) }))}
+                  className="w-full min-h-[38px] rounded-xl border border-slate-200 dark:border-white/[0.09] bg-white dark:bg-[#11151E] px-2.5 font-mono"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] text-slate-500 mb-1">ساعة الانتهاء (0-23)</label>
+                <input
+                  type="number"
+                  min={0}
+                  max={23}
+                  dir="ltr"
+                  value={notif.turboEndHour ?? 7}
+                  onChange={(e) => setNotif((p) => ({ ...p, turboEndHour: Number(e.target.value) }))}
+                  className="w-full min-h-[38px] rounded-xl border border-slate-200 dark:border-white/[0.09] bg-white dark:bg-[#11151E] px-2.5 font-mono"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] text-slate-500 mb-1">باقة التوربو الافتراضية</label>
+                <input
+                  type="text"
+                  dir="ltr"
+                  value={notif.turboDefaultProfile || ''}
+                  onChange={(e) => setNotif((p) => ({ ...p, turboDefaultProfile: e.target.value }))}
+                  placeholder="مثال: vip-turbo"
+                  className="w-full min-h-[38px] rounded-xl border border-slate-200 dark:border-white/[0.09] bg-white dark:bg-[#11151E] px-2.5 font-mono"
+                />
+              </div>
+            </div>
+          </div>
+
+          <button
+            type="submit"
+            className="min-h-[42px] px-5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold"
+          >
+            حفظ إعدادات TR-069 / RADIUS / التوربو
+          </button>
+        </form>
+      )}
+
+      {/* Team RBAC Management (#84, #96 Per-Tower RBAC) */}
       {user.role === 'admin' && (
         <div className="rounded-[22px] bg-white dark:bg-[#11151E] border border-slate-200/80 dark:border-white/[0.07] p-5 space-y-4">
           <div className="flex items-center gap-2 text-sm font-bold text-slate-900 dark:text-white">
             <Users className="w-4 h-4 text-sky-500" />
-            <span>فريق العمل والصلاحيات (RBAC)</span>
+            <span>فريق العمل وصلاحيات الأبراج (RBAC)</span>
           </div>
 
-          <form onSubmit={(e) => void handleAddMember(e)} className="grid grid-cols-1 sm:grid-cols-5 gap-2.5">
-            <input
-              type="text"
-              required
-              value={newName}
-              onChange={(e) => setNewName(e.target.value)}
-              placeholder="الاسم"
-              className="min-h-[42px] rounded-xl border border-slate-200 dark:border-white/[0.09] bg-slate-50 dark:bg-[#171C28] px-3 text-xs text-slate-900 dark:text-white"
-            />
-            <input
-              type="email"
-              required
-              dir="ltr"
-              value={newEmail}
-              onChange={(e) => setNewEmail(e.target.value)}
-              placeholder="البريد"
-              className="min-h-[42px] rounded-xl border border-slate-200 dark:border-white/[0.09] bg-slate-50 dark:bg-[#171C28] px-3 text-xs font-mono text-slate-900 dark:text-white"
-            />
-            <input
-              type="password"
-              required
-              minLength={6}
-              dir="ltr"
-              value={newPass}
-              onChange={(e) => setNewPass(e.target.value)}
-              placeholder="كلمة المرور"
-              className="min-h-[42px] rounded-xl border border-slate-200 dark:border-white/[0.09] bg-slate-50 dark:bg-[#171C28] px-3 text-xs font-mono text-slate-900 dark:text-white"
-            />
-            <select
-              value={newRole}
-              onChange={(e) => setNewRole(e.target.value as UserRole)}
-              className="min-h-[42px] rounded-xl border border-slate-200 dark:border-white/[0.09] bg-slate-50 dark:bg-[#171C28] px-2.5 text-xs font-bold text-slate-900 dark:text-white"
-            >
-              <option value="technician">فني شبكات</option>
-              <option value="accountant">محاسب</option>
-              <option value="viewer">مشاهدة فقط</option>
-              <option value="admin">مدير</option>
-            </select>
-            <button
-              type="submit"
-              className="min-h-[42px] rounded-xl bg-sky-600 text-white text-xs font-bold inline-flex items-center justify-center gap-1"
-            >
-              <Plus className="w-4 h-4" /> إضافة
-            </button>
+          <form onSubmit={(e) => void handleAddMember(e)} className="space-y-3">
+            <div className="grid grid-cols-1 sm:grid-cols-5 gap-2.5">
+              <input
+                type="text"
+                required
+                value={newName}
+                onChange={(e) => setNewName(e.target.value)}
+                placeholder="الاسم"
+                className="min-h-[42px] rounded-xl border border-slate-200 dark:border-white/[0.09] bg-slate-50 dark:bg-[#171C28] px-3 text-xs text-slate-900 dark:text-white"
+              />
+              <input
+                type="email"
+                required
+                dir="ltr"
+                value={newEmail}
+                onChange={(e) => setNewEmail(e.target.value)}
+                placeholder="البريد"
+                className="min-h-[42px] rounded-xl border border-slate-200 dark:border-white/[0.09] bg-slate-50 dark:bg-[#171C28] px-3 text-xs font-mono text-slate-900 dark:text-white"
+              />
+              <input
+                type="password"
+                required
+                minLength={6}
+                dir="ltr"
+                value={newPass}
+                onChange={(e) => setNewPass(e.target.value)}
+                placeholder="كلمة المرور"
+                className="min-h-[42px] rounded-xl border border-slate-200 dark:border-white/[0.09] bg-slate-50 dark:bg-[#171C28] px-3 text-xs font-mono text-slate-900 dark:text-white"
+              />
+              <select
+                value={newRole}
+                onChange={(e) => setNewRole(e.target.value as UserRole)}
+                className="min-h-[42px] rounded-xl border border-slate-200 dark:border-white/[0.09] bg-slate-50 dark:bg-[#171C28] px-2.5 text-xs font-bold text-slate-900 dark:text-white"
+              >
+                <option value="technician">فني شبكات</option>
+                <option value="accountant">محاسب</option>
+                <option value="viewer">مشاهدة فقط</option>
+                <option value="admin">مدير</option>
+              </select>
+              <button
+                type="submit"
+                className="min-h-[42px] rounded-xl bg-sky-600 text-white text-xs font-bold inline-flex items-center justify-center gap-1"
+              >
+                <Plus className="w-4 h-4" /> إضافة
+              </button>
+            </div>
+
+            {towers.length > 0 && newRole !== 'admin' && (
+              <div className="flex flex-wrap items-center gap-2 text-[11px] bg-slate-50 dark:bg-[#171C28] rounded-xl p-2.5">
+                <span className="font-bold text-slate-500">تقييد الوصول للأبراج (اتركه فارغاً للوصول للكل):</span>
+                {towers.map((t) => (
+                  <label key={t.id} className="inline-flex items-center gap-1 font-semibold text-slate-700 dark:text-slate-300 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={newAllowedTowers.includes(t.id)}
+                      onChange={(e) =>
+                        setNewAllowedTowers((prev) =>
+                          e.target.checked ? [...prev, t.id] : prev.filter((id) => id !== t.id)
+                        )
+                      }
+                      className="accent-sky-500"
+                    />
+                    <span>{t.name}</span>
+                  </label>
+                ))}
+              </div>
+            )}
           </form>
 
           <div className="divide-y divide-slate-100 dark:divide-white/[0.06]">
             {teamMembers.map((m) => (
-              <div key={m.id} className="py-2.5 flex items-center justify-between text-xs">
-                <div>
-                  <span className="font-bold text-slate-900 dark:text-white">{m.name}</span> ·{' '}
-                  <span className="text-sky-500 font-bold">{ROLE_LABELS[m.role]}</span>
-                  <div className="font-mono text-slate-400 text-[11px]" dir="ltr">
-                    {m.email}
+              <div key={m.id} className="py-3 space-y-2 text-xs">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <span className="font-bold text-slate-900 dark:text-white">{m.name}</span> ·{' '}
+                    <span className="text-sky-500 font-bold">{ROLE_LABELS[m.role]}</span>
+                    <div className="font-mono text-slate-400 text-[11px]" dir="ltr">
+                      {m.email}
+                    </div>
                   </div>
+                  {m.id !== user.id && (
+                    <button
+                      type="button"
+                      onClick={() => void handleDeleteMember(m.id)}
+                      className="p-2 text-slate-400 hover:text-red-500"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  )}
                 </div>
-                {m.id !== user.id && (
-                  <button
-                    type="button"
-                    onClick={() => void handleDeleteMember(m.id)}
-                    className="p-2 text-slate-400 hover:text-red-500"
-                  >
-                    <Trash2 className="w-4 h-4" />
-                  </button>
+                {m.role !== 'admin' && towers.length > 0 && (
+                  <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+                    <span className="text-slate-400">الأبراج المسموحة:</span>
+                    {towers.map((t) => {
+                      const allowed = (m.allowedTowerIds || []).includes(t.id);
+                      return (
+                        <button
+                          key={t.id}
+                          type="button"
+                          onClick={() => void handleToggleMemberTower(m, t.id)}
+                          className={`px-2 py-0.5 rounded-lg border font-semibold ${
+                            allowed
+                              ? 'bg-sky-600 border-sky-600 text-white'
+                              : 'border-slate-200 dark:border-white/[0.09] text-slate-500'
+                          }`}
+                        >
+                          {t.name}
+                        </button>
+                      );
+                    })}
+                    {(m.allowedTowerIds || []).length === 0 && (
+                      <span className="text-emerald-500 font-bold">(كل الأبراج)</span>
+                    )}
+                  </div>
                 )}
               </div>
             ))}
@@ -854,6 +1111,52 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               </div>
             </div>
           )}
+        </div>
+      )}
+
+      {/* Domain & Free Let's Encrypt HTTPS Proxy Card (#100) */}
+      {user.role === 'admin' && (
+        <div className="rounded-[22px] bg-white dark:bg-[#11151E] border border-slate-200/80 dark:border-white/[0.07] p-5 space-y-3">
+          <div className="flex items-center gap-2 text-sm font-bold text-slate-900 dark:text-white">
+            <Shield className="w-4 h-4 text-emerald-500" />
+            <span>تفعيل الدومين وشهادة SSL المجانية (HTTPS / Caddy)</span>
+          </div>
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            شغّل هذا الأمر داخل سيرفر Oracle VPS لتفعيل HTTPS رسمي مجاني مع تجديد تلقائي لشهادة Let&apos;s Encrypt (اترك النطاق فارغاً لاستخدام نطاق sslip.io تلقائياً من IP السيرفر).
+          </p>
+          <div className="flex flex-col sm:flex-row gap-2">
+            <input
+              type="text"
+              dir="ltr"
+              value={httpsDomainInput}
+              onChange={(e) => setHttpsDomainInput(e.target.value)}
+              placeholder="panel.yourdomain.com (اختياري)"
+              className="flex-1 min-h-[42px] rounded-xl border border-slate-200 dark:border-white/[0.09] bg-slate-50 dark:bg-[#171C28] px-3 text-xs font-mono text-slate-900 dark:text-white"
+            />
+            <button
+              type="button"
+              onClick={() => {
+                const cmd = `cd ~/bro-radius && sudo bash scripts/enable-https.sh${
+                  httpsDomainInput.trim() ? ` ${httpsDomainInput.trim()}` : ''
+                }`;
+                void navigator.clipboard.writeText(cmd);
+                setHttpsCopied(true);
+                setTimeout(() => setHttpsCopied(false), 1800);
+              }}
+              className="min-h-[42px] px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold inline-flex items-center justify-center gap-1.5"
+            >
+              {httpsCopied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+              <span>{httpsCopied ? 'تم النسخ' : 'نسخ أمر التفعيل'}</span>
+            </button>
+          </div>
+          <pre
+            dir="ltr"
+            className="rounded-xl bg-[#070A10] text-emerald-300 border border-white/[0.08] p-3 text-[11px] font-mono overflow-x-auto text-left"
+          >
+            {`cd ~/bro-radius && sudo bash scripts/enable-https.sh${
+              httpsDomainInput.trim() ? ` ${httpsDomainInput.trim()}` : ''
+            }`}
+          </pre>
         </div>
       )}
 

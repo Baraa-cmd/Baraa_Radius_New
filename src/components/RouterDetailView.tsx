@@ -7,6 +7,7 @@ import {
   ArrowRight,
   ArrowUp,
   Check,
+  Clock,
   Copy,
   Cpu,
   Database,
@@ -16,12 +17,15 @@ import {
   EyeOff,
   Fan,
   FileText,
+  Gauge,
+  GitCompare,
   Globe,
   HardDrive,
   KeyRound,
   Layers,
   Network,
   Plus,
+  Power,
   Radio,
   RefreshCw,
   Router,
@@ -35,37 +39,62 @@ import {
   UserCheck,
   Users,
   Wifi,
+  Wrench,
   X,
   Zap,
 } from 'lucide-react';
 import type {
   ApiPermissionMode,
+  ConfigDiffRecord,
   ConnectionType,
   DiagnosticDataset,
+  FailoverEventRecord,
+  LatencyProbeRecord,
   PortRole,
+  RfRadioDevice,
   RouterAlertItem,
   RouterAlertRules,
   RouterBackupItem,
   RouterDevice,
   RouterPort,
+  SecurityAuditResult,
   ServerCapabilities,
   SubscriberRecord,
+  TorchEntry,
+  TowerNode,
   TrafficSample,
 } from '../types';
+import { CpeDetailModal } from './CpeDetailModal';
+import { TopologyView } from './TopologyView';
 
-type RouterTab = 'overview' | 'ports' | 'usage' | 'subscribers' | 'devices' | 'info' | 'alerts';
+type RouterTab =
+  | 'overview'
+  | 'ports'
+  | 'usage'
+  | 'subscribers'
+  | 'devices'
+  | 'topology'
+  | 'tools'
+  | 'info'
+  | 'alerts';
 
 interface RouterDetailViewProps {
   token: string;
   router: RouterDevice;
   subscribers: SubscriberRecord[];
   alerts: RouterAlertItem[];
+  rfRadios?: RfRadioDevice[];
+  towers?: TowerNode[];
   onBack: () => void;
   onUpdateRouter: (updated: RouterDevice) => void;
   onDeleteRouter: (routerId: string) => Promise<void>;
   onAckAlert: (alertId: string) => void;
   onDisconnectSubscriber: (subId: string) => Promise<void>;
   onToggleSubscriberDisabled: (subId: string, disabled: boolean) => Promise<void>;
+  onUpdateSubscriber?: (
+    subId: string,
+    patch: Partial<SubscriberRecord> & { graceHours?: number }
+  ) => Promise<void>;
 }
 
 const PORT_ROLES: PortRole[] = ['WAN', 'ISP', 'Tower', 'Switch', 'LAN', 'Unassigned'];
@@ -226,16 +255,20 @@ export const RouterDetailView: React.FC<RouterDetailViewProps> = ({
   router,
   subscribers,
   alerts,
+  rfRadios = [],
+  towers = [],
   onBack,
   onUpdateRouter,
   onDeleteRouter,
   onAckAlert,
   onDisconnectSubscriber,
   onToggleSubscriberDisabled,
+  onUpdateSubscriber,
 }) => {
   const [activeTab, setActiveTab] = useState<RouterTab>('overview');
   const [refreshing, setRefreshing] = useState(false);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
+  const [cpeSub, setCpeSub] = useState<SubscriberRecord | null>(null);
 
   const [portFilter, setPortFilter] = useState<'all' | 'up' | 'down' | 'monitored'>('all');
   const [editingPort, setEditingPort] = useState<RouterPort | null>(null);
@@ -243,6 +276,7 @@ export const RouterDetailView: React.FC<RouterDetailViewProps> = ({
   const [editPortRole, setEditPortRole] = useState<PortRole>('Unassigned');
   const [editPortMonitored, setEditPortMonitored] = useState(true);
   const [editPortSpeed, setEditPortSpeed] = useState<'1G' | '100M' | '10G'>('1G');
+  const [poeCycling, setPoeCycling] = useState(false);
 
   const [usagePeriod, setUsagePeriod] = useState<'24h' | '7d' | '30d'>('24h');
   const [portHistorySamples, setPortHistorySamples] = useState<
@@ -260,7 +294,38 @@ export const RouterDetailView: React.FC<RouterDetailViewProps> = ({
 
   const [diagnostics, setDiagnostics] = useState<DiagnosticDataset | null>(null);
   const [activeDiagKey, setActiveDiagKey] = useState<string | null>(null);
+  const [logTopicFilter, setLogTopicFilter] = useState<string>('all');
   const [backups, setBackups] = useState<RouterBackupItem[]>([]);
+
+  // Tools & Multi-WAN state (#36, #39, #43, #45, #66, #72, #73, #74, #77, #79, #80, #88)
+  const [torchIface, setTorchIface] = useState(router.ports[0]?.name || 'ether1');
+  const [torchRows, setTorchRows] = useState<TorchEntry[]>([]);
+  const [torchBusy, setTorchBusy] = useState(false);
+
+  const [btestTarget, setBtestTarget] = useState('');
+  const [btestDir, setBtestDir] = useState<'both' | 'receive' | 'transmit'>('both');
+  const [btestProto, setBtestProto] = useState<'tcp' | 'udp'>('tcp');
+  const [btestResult, setBtestResult] = useState<{ rxMbps: number; txMbps: number; status: string } | null>(null);
+  const [btestBusy, setBtestBusy] = useState(false);
+
+  const [traceTarget, setTraceTarget] = useState('1.1.1.1');
+  const [traceHops, setTraceHops] = useState<Array<{ hop: number; address: string; lossPct: number; avgMs: string }>>([]);
+  const [traceBusy, setTraceBusy] = useState(false);
+
+  const [latencyProbes, setLatencyProbes] = useState<LatencyProbeRecord[]>([]);
+  const [failoverEvents, setFailoverEvents] = useState<FailoverEventRecord[]>([]);
+  const [probeBusy, setProbeBusy] = useState(false);
+
+  const [configDiffs, setConfigDiffs] = useState<ConfigDiffRecord[]>([]);
+  const [activeDiffId, setActiveDiffId] = useState<string | null>(null);
+  const [diffBusy, setDiffBusy] = useState(false);
+
+  const [securityAudit, setSecurityAudit] = useState<SecurityAuditResult | null>(null);
+  const [auditBusy, setAuditBusy] = useState(false);
+
+  const [dualWgEndpoint, setDualWgEndpoint] = useState('');
+  const [dualWgPort, setDualWgPort] = useState('51821');
+  const [toolStatusMsg, setToolStatusMsg] = useState<string | null>(null);
 
   const [scriptModal, setScriptModal] = useState<{ title: string; script: string } | null>(null);
   const [scriptCopied, setScriptCopied] = useState(false);
@@ -435,14 +500,37 @@ export const RouterDetailView: React.FC<RouterDetailViewProps> = ({
   }, [activeTab, usagePeriod, router.id, token]);
 
   useEffect(() => {
-    if (activeTab !== 'info') return;
+    if (activeTab !== 'info' && activeTab !== 'tools') return;
     void (async () => {
-      const bakRes = await fetch(`/api/routers/${router.id}/backups`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      if (bakRes.ok) {
-        const data = await bakRes.json();
-        setBackups(data.backups || []);
+      if (activeTab === 'info') {
+        const bakRes = await fetch(`/api/routers/${router.id}/backups`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (bakRes.ok) {
+          const data = await bakRes.json();
+          setBackups(data.backups || []);
+        }
+      }
+      if (activeTab === 'tools') {
+        const [latRes, difRes] = await Promise.all([
+          fetch(`/api/routers/${router.id}/latency`, {
+            headers: { Authorization: `Bearer ${token}` },
+          }),
+          fetch(`/api/routers/${router.id}/config-diffs`, {
+            headers: { Authorization: `Bearer ${token}` },
+          }),
+        ]);
+        if (latRes.ok) {
+          const lData = await latRes.json();
+          setLatencyProbes(lData.probes || []);
+          setFailoverEvents(lData.failovers || []);
+        }
+        if (difRes.ok) {
+          const dData = await difRes.json();
+          const list = (dData.diffs || []) as ConfigDiffRecord[];
+          setConfigDiffs(list);
+          if (list[0] && !activeDiffId) setActiveDiffId(list[0].id);
+        }
       }
       if (!diagnostics && router.status === 'online') {
         const diagRes = await fetch(`/api/routers/${router.id}/diagnostics`, {
@@ -453,6 +541,7 @@ export const RouterDetailView: React.FC<RouterDetailViewProps> = ({
         }
       }
     })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab, diagnostics, router.id, router.status, token]);
 
   const routerAlerts = alerts.filter((a) => a.routerId === router.id && !a.acknowledged);
@@ -651,12 +740,228 @@ export const RouterDetailView: React.FC<RouterDetailViewProps> = ({
     }
   };
 
+  const handleCyclePoe = async () => {
+    if (!editingPort) return;
+    setPoeCycling(true);
+    setActionMsg(null);
+    try {
+      const res = await fetch(`/api/routers/${router.id}/poe/${encodeURIComponent(editingPort.name)}/cycle`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await res.json();
+      setActionMsg(data.message || data.error || 'تم تنفيذ أمر PoE');
+    } finally {
+      setPoeCycling(false);
+    }
+  };
+
+  const handleRunTorch = async () => {
+    setTorchBusy(true);
+    setToolStatusMsg(null);
+    try {
+      const res = await fetch(`/api/routers/${router.id}/torch`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ iface: torchIface }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setToolStatusMsg(data.error || 'تعذر تشغيل Torch');
+        return;
+      }
+      setTorchRows(data.entries || []);
+    } finally {
+      setTorchBusy(false);
+    }
+  };
+
+  const handleRunBtest = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setBtestBusy(true);
+    setToolStatusMsg(null);
+    try {
+      const res = await fetch(`/api/routers/${router.id}/bandwidth-test`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ target: btestTarget, direction: btestDir, protocol: btestProto }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setToolStatusMsg(data.error || 'فشل Bandwidth-Test');
+        return;
+      }
+      setBtestResult({ rxMbps: data.rxMbps, txMbps: data.txMbps, status: data.status });
+    } finally {
+      setBtestBusy(false);
+    }
+  };
+
+  const handleRunTraceroute = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setTraceBusy(true);
+    setToolStatusMsg(null);
+    try {
+      const res = await fetch(`/api/routers/${router.id}/traceroute`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ target: traceTarget }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setToolStatusMsg(data.error || 'فشل Traceroute');
+        return;
+      }
+      setTraceHops(data.hops || []);
+    } finally {
+      setTraceBusy(false);
+    }
+  };
+
+  const handleQuickRouterAction = async (
+    endpoint: string,
+    body?: Record<string, unknown>,
+    fallbackMsg = 'تم التنفيذ'
+  ) => {
+    setToolStatusMsg(null);
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      setToolStatusMsg(data.error || 'تعذر التنفيذ');
+      return;
+    }
+    if (data.results && Array.isArray(data.results)) {
+      setToolStatusMsg(`فحص جماعي: ${data.results.map((r: { name: string; status: string }) => `${r.name} (${r.status})`).join(' · ')}`);
+    } else if (data.latestVersion) {
+      setToolStatusMsg(`الإصدار المثبت: ${data.installedVersion} · الأحدث: ${data.latestVersion} (${data.status})`);
+    } else {
+      setToolStatusMsg(data.message || fallbackMsg);
+    }
+  };
+
+  const handleProbeLatency = async () => {
+    setProbeBusy(true);
+    setToolStatusMsg(null);
+    try {
+      const res = await fetch(`/api/routers/${router.id}/latency/probe`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.ok) {
+        const latRes = await fetch(`/api/routers/${router.id}/latency`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (latRes.ok) {
+          const lData = await latRes.json();
+          setLatencyProbes(lData.probes || []);
+          setFailoverEvents(lData.failovers || []);
+        }
+      }
+    } finally {
+      setProbeBusy(false);
+    }
+  };
+
+  const handleToggleRoute = async (routeId: string, currentlyDisabled: boolean, comment?: string) => {
+    setToolStatusMsg(null);
+    const res = await fetch(`/api/routers/${router.id}/routes/toggle`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ routeId, disabled: !currentlyDisabled, comment }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      setToolStatusMsg(data.error || 'تعذر تعديل المسار');
+      return;
+    }
+    const [diagRes, latRes] = await Promise.all([
+      fetch(`/api/routers/${router.id}/diagnostics`, { headers: { Authorization: `Bearer ${token}` } }),
+      fetch(`/api/routers/${router.id}/latency`, { headers: { Authorization: `Bearer ${token}` } }),
+    ]);
+    if (diagRes.ok) setDiagnostics(await diagRes.json());
+    if (latRes.ok) {
+      const lData = await latRes.json();
+      setLatencyProbes(lData.probes || []);
+      setFailoverEvents(lData.failovers || []);
+    }
+    setToolStatusMsg('تم تحديث حالة المسار وتوثيق التحويل');
+  };
+
+  const handleCaptureConfigDiff = async () => {
+    setDiffBusy(true);
+    setToolStatusMsg(null);
+    try {
+      const res = await fetch(`/api/routers/${router.id}/config-diffs`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setToolStatusMsg(data.error || 'تعذر قراءة مقارنة .rsc');
+        return;
+      }
+      const listRes = await fetch(`/api/routers/${router.id}/config-diffs`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (listRes.ok) {
+        const dData = await listRes.json();
+        setConfigDiffs(dData.diffs || []);
+        setActiveDiffId(data.id);
+      }
+    } finally {
+      setDiffBusy(false);
+    }
+  };
+
+  const handleRunSecurityAudit = async () => {
+    setAuditBusy(true);
+    setToolStatusMsg(null);
+    try {
+      const res = await fetch(`/api/routers/${router.id}/security-audit`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setToolStatusMsg(data.error || 'فشل تدقيق الأمان');
+        return;
+      }
+      setSecurityAudit(data as SecurityAuditResult);
+    } finally {
+      setAuditBusy(false);
+    }
+  };
+
+  const handleGenerateDualWg = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const res = await fetch(`/api/routers/${router.id}/dual-wg-script`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        secondaryEndpoint: dualWgEndpoint,
+        secondaryPort: Number(dualWgPort) || 51821,
+      }),
+    });
+    const data = await res.json();
+    if (res.ok && data.script) {
+      setScriptModal({
+        title: 'سكربت نفق WireGuard الاحتياطي المزدوج (Dual-Homed)',
+        script: data.script,
+      });
+    }
+  };
+
   const tabs: Array<{ id: RouterTab; label: string }> = [
     { id: 'overview', label: 'نظرة عامة' },
     { id: 'ports', label: 'المنافذ' },
     { id: 'usage', label: 'الاستهلاك' },
     { id: 'subscribers', label: 'المشتركين' },
     { id: 'devices', label: 'الأجهزة' },
+    { id: 'topology', label: 'التوبولوجي' },
+    { id: 'tools', label: 'أدوات وMulti-WAN' },
     { id: 'info', label: 'معلومات ونسخ' },
     { id: 'alerts', label: 'التنبيهات' },
   ];
@@ -666,14 +971,19 @@ export const RouterDetailView: React.FC<RouterDetailViewProps> = ({
     { key: 'routes', title: 'المسارات والبوابة', icon: Route, color: 'from-indigo-500 to-sky-600' },
     { key: 'dhcpLeases', title: 'DHCP Leases', icon: Server, color: 'from-amber-500 to-orange-600' },
     { key: 'arpTable', title: 'جدول ARP', icon: FileText, color: 'from-teal-500 to-emerald-600' },
+    { key: 'arpConflicts', title: 'تعارضات ARP / MAC', icon: AlertTriangle, color: 'from-red-500 to-orange-600' },
+    { key: 'rogueDhcpAlerts', title: 'كشف Rogue DHCP', icon: Shield, color: 'from-rose-500 to-red-600' },
     { key: 'pppoeServers', title: 'سيرفرات PPPoE', icon: Database, color: 'from-sky-600 to-cyan-600' },
     { key: 'pppProfiles', title: 'باقات PPP', icon: UserCheck, color: 'from-cyan-500 to-teal-600' },
+    { key: 'ipPools', title: 'تجمعات IP Pools', icon: Database, color: 'from-cyan-600 to-blue-700' },
     { key: 'hotspotActive', title: 'الهوتسبوت المتصل', icon: Wifi, color: 'from-blue-500 to-indigo-600' },
     { key: 'simpleQueues', title: 'Simple Queues', icon: Activity, color: 'from-amber-500 to-yellow-600' },
     { key: 'vlans', title: 'VLANs', icon: Layers, color: 'from-sky-500 to-indigo-500' },
+    { key: 'bridgePorts', title: 'Bridge Ports (STP)', icon: Layers, color: 'from-violet-500 to-indigo-600' },
     { key: 'wirelessClients', title: 'الوايرلس', icon: Radio, color: 'from-emerald-500 to-teal-600' },
     { key: 'services', title: 'خدمات الراوتر', icon: Settings2, color: 'from-slate-500 to-slate-700' },
     { key: 'dnsSettings', title: 'DNS', icon: Globe, color: 'from-teal-500 to-cyan-600' },
+    { key: 'ntpStatus', title: 'ساعة النظام NTP', icon: Clock, color: 'from-emerald-600 to-teal-600' },
     { key: 'logs', title: 'السجلات (Log)', icon: FileText, color: 'from-orange-500 to-red-600' },
   ];
 
@@ -1166,14 +1476,21 @@ export const RouterDetailView: React.FC<RouterDetailViewProps> = ({
                         <span className="text-teal-500 inline-flex items-center gap-1" dir="ltr">
                           <ArrowUp className="w-3.5 h-3.5" /> {port.txMbps} Mbps
                         </span>
-                        {(port.rxErrors > 0 || port.rxDrops > 0) && (
+                        {(port.rxErrors > 0 || port.rxDrops > 0 || (port.txDrops ?? 0) > 0) && (
                           <span className="text-amber-500 text-[11px]" dir="ltr">
-                            FCS:{port.rxErrors} Drop:{port.rxDrops}
+                            FCS:{port.rxErrors} RxD:{port.rxDrops} TxD:{port.txDrops ?? 0}
+                          </span>
+                        )}
+                        {port.poeStatus && (
+                          <span className="text-emerald-500 text-[11px]" dir="ltr">
+                            PoE: {port.poeStatus} {port.poeWatts != null ? `${port.poeWatts}W` : ''} {port.poeVoltage != null ? `${port.poeVoltage}V` : ''}
                           </span>
                         )}
                         {port.sfpRxDbm !== null && (
                           <span className="text-cyan-500 text-[11px]" dir="ltr">
                             SFP: {port.sfpRxDbm}dBm / {port.sfpTempC ?? '-'}°C
+                            {port.sfpVoltageV != null ? ` / ${port.sfpVoltageV}V` : ''}
+                            {port.sfpBiasMa != null ? ` / ${port.sfpBiasMa}mA` : ''}
                           </span>
                         )}
                       </div>
@@ -1385,7 +1702,14 @@ export const RouterDetailView: React.FC<RouterDetailViewProps> = ({
                     </div>
                   </div>
 
-                  <div className="flex items-center gap-2 shrink-0">
+                  <div className="flex flex-wrap items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => setCpeSub(sub)}
+                      className="min-h-[38px] px-3 rounded-xl bg-sky-500/15 text-sky-600 dark:text-sky-400 hover:bg-sky-500/25 text-xs font-bold"
+                    >
+                      راوتر المنزل / CoA
+                    </button>
                     {sub.online && (
                       <button
                         type="button"
@@ -1576,7 +1900,477 @@ export const RouterDetailView: React.FC<RouterDetailViewProps> = ({
         </div>
       )}
 
-      {/* TAB 6: INFO & BACKUPS (#19) */}
+      {/* TAB 6: TOPOLOGY (#34) */}
+      {activeTab === 'topology' && (
+        <TopologyView router={router} rfRadios={rfRadios} towers={towers} />
+      )}
+
+      {/* TAB 7: TOOLS & MULTI-WAN (#36, #39, #43, #45, #66, #72, #73, #74, #77, #79, #80, #88) */}
+      {activeTab === 'tools' && (
+        <div className="space-y-5">
+          {toolStatusMsg && (
+            <div className="rounded-2xl bg-sky-500/10 border border-sky-500/25 px-4 py-3 text-xs font-bold text-sky-600 dark:text-sky-400">
+              {toolStatusMsg}
+            </div>
+          )}
+
+          {/* Quick Controls: DNS Flush, NTP Sync, RouterOS/Firmware Upgrade, Bulk Check */}
+          <div className="rounded-[22px] bg-white dark:bg-[#11151E] border border-slate-200/80 dark:border-white/[0.07] p-5 space-y-3">
+            <div className="flex items-center gap-2 text-sm font-bold text-slate-900 dark:text-white">
+              <Wrench className="w-4 h-4 text-sky-500" />
+              <span>أوامر الصيانة والترقية السريعة (RouterOS & Firmware)</span>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => void handleQuickRouterAction(`/api/routers/${router.id}/dns/flush`)}
+                className="min-h-[40px] px-3.5 rounded-xl bg-slate-100 dark:bg-[#171C28] text-xs font-bold text-slate-800 dark:text-slate-200 hover:border-sky-500 border border-transparent"
+              >
+                مسح كاش DNS
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleQuickRouterAction(`/api/routers/${router.id}/ntp/sync`)}
+                className="min-h-[40px] px-3.5 rounded-xl bg-slate-100 dark:bg-[#171C28] text-xs font-bold text-slate-800 dark:text-slate-200"
+              >
+                تفعيل ومزامنة NTP
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleQuickRouterAction(`/api/routers/${router.id}/upgrade`, { mode: 'check' })}
+                className="min-h-[40px] px-3.5 rounded-xl bg-sky-500/15 text-sky-600 dark:text-sky-400 text-xs font-bold"
+              >
+                فحص تحديث RouterOS
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleQuickRouterAction(`/api/routers/${router.id}/upgrade`, { mode: 'install' })}
+                className="min-h-[40px] px-3.5 rounded-xl bg-amber-500/15 text-amber-500 text-xs font-bold"
+              >
+                تنزيل وتثبيت RouterOS
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleQuickRouterAction(`/api/routers/${router.id}/upgrade`, { mode: 'routerboard' })}
+                className="min-h-[40px] px-3.5 rounded-xl bg-indigo-500/15 text-indigo-400 text-xs font-bold"
+              >
+                ترقية RouterBOOT Firmware
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleQuickRouterAction('/api/routers/bulk-upgrade')}
+                className="min-h-[40px] px-3.5 rounded-xl bg-emerald-500/15 text-emerald-500 text-xs font-bold"
+              >
+                فحص جماعي لكل الراوترات
+              </button>
+            </div>
+          </div>
+
+          {/* Live Torch (#36) */}
+          <div className="rounded-[22px] bg-white dark:bg-[#11151E] border border-slate-200/80 dark:border-white/[0.07] p-5 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-2 text-sm font-bold text-slate-900 dark:text-white">
+                <Activity className="w-4 h-4 text-orange-500" />
+                <span>فحص الاستهلاك الحي (Torch)</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <select
+                  value={torchIface}
+                  onChange={(e) => setTorchIface(e.target.value)}
+                  dir="ltr"
+                  className="min-h-[38px] rounded-xl border border-slate-200 dark:border-white/[0.09] bg-slate-50 dark:bg-[#171C28] px-3 text-xs font-mono text-slate-900 dark:text-white"
+                >
+                  {router.ports.length > 0 ? (
+                    router.ports.map((p) => (
+                      <option key={p.id} value={p.name}>
+                        {p.name} ({p.label})
+                      </option>
+                    ))
+                  ) : (
+                    <option value="ether1">ether1</option>
+                  )}
+                </select>
+                <button
+                  type="button"
+                  disabled={torchBusy}
+                  onClick={() => void handleRunTorch()}
+                  className="min-h-[38px] px-4 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-xs font-bold disabled:opacity-60"
+                >
+                  {torchBusy ? 'جاري الفحص (2ث)...' : 'تشغيل Torch'}
+                </button>
+              </div>
+            </div>
+            {torchRows.length > 0 && (
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs font-mono tabular-nums" dir="ltr">
+                  <thead className="bg-slate-50 dark:bg-[#171C28] text-slate-400">
+                    <tr>
+                      <th className="py-2 px-3 text-left">Src</th>
+                      <th className="py-2 px-3 text-left">Dst</th>
+                      <th className="py-2 px-3 text-left">Proto / Port</th>
+                      <th className="py-2 px-3 text-right">Rx Mbps</th>
+                      <th className="py-2 px-3 text-right">Tx Mbps</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 dark:divide-white/[0.06]">
+                    {torchRows.map((row, idx) => (
+                      <tr key={idx}>
+                        <td className="py-2 px-3">{row.srcAddress}</td>
+                        <td className="py-2 px-3">{row.dstAddress}</td>
+                        <td className="py-2 px-3 text-slate-400">{row.protocol}:{row.dstPort || '*'}</td>
+                        <td className="py-2 px-3 text-right text-sky-500">{row.rxMbps}M</td>
+                        <td className="py-2 px-3 text-right text-teal-500">{row.txMbps}M</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+
+          {/* Bandwidth Test (#43) & Traceroute (#79) */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <form
+              onSubmit={(e) => void handleRunBtest(e)}
+              className="rounded-[22px] bg-white dark:bg-[#11151E] border border-slate-200/80 dark:border-white/[0.07] p-5 space-y-3"
+            >
+              <div className="flex items-center gap-2 text-sm font-bold text-slate-900 dark:text-white">
+                <Gauge className="w-4 h-4 text-emerald-500" />
+                <span>اختبار السرعة بين راوترين (Bandwidth-Test)</span>
+              </div>
+              <div className="grid grid-cols-3 gap-2">
+                <input
+                  type="text"
+                  required
+                  dir="ltr"
+                  value={btestTarget}
+                  onChange={(e) => setBtestTarget(e.target.value)}
+                  placeholder="IP الطرف المقابل"
+                  className="col-span-3 sm:col-span-1 min-h-[40px] rounded-xl border border-slate-200 dark:border-white/[0.09] bg-slate-50 dark:bg-[#171C28] px-3 text-xs font-mono"
+                />
+                <select
+                  value={btestDir}
+                  onChange={(e) => setBtestDir(e.target.value as 'both' | 'receive' | 'transmit')}
+                  className="min-h-[40px] rounded-xl border border-slate-200 dark:border-white/[0.09] bg-slate-50 dark:bg-[#171C28] px-2 text-xs font-bold"
+                >
+                  <option value="both">Both (Rx/Tx)</option>
+                  <option value="receive">Receive</option>
+                  <option value="transmit">Transmit</option>
+                </select>
+                <select
+                  value={btestProto}
+                  onChange={(e) => setBtestProto(e.target.value as 'tcp' | 'udp')}
+                  className="min-h-[40px] rounded-xl border border-slate-200 dark:border-white/[0.09] bg-slate-50 dark:bg-[#171C28] px-2 text-xs font-bold"
+                >
+                  <option value="tcp">TCP</option>
+                  <option value="udp">UDP</option>
+                </select>
+              </div>
+              <button
+                type="submit"
+                disabled={btestBusy}
+                className="w-full min-h-[40px] rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold disabled:opacity-60"
+              >
+                {btestBusy ? 'جاري الاختبار (3 ثوانٍ)...' : 'بدء Bandwidth-Test'}
+              </button>
+              {btestResult && (
+                <div className="rounded-xl bg-emerald-500/10 border border-emerald-500/20 p-3 flex items-center justify-between text-xs font-mono" dir="ltr">
+                  <span className="text-sky-500 font-bold">Rx: {btestResult.rxMbps} Mbps</span>
+                  <span className="text-teal-500 font-bold">Tx: {btestResult.txMbps} Mbps</span>
+                  <span className="text-slate-400">{btestResult.status}</span>
+                </div>
+              )}
+            </form>
+
+            <form
+              onSubmit={(e) => void handleRunTraceroute(e)}
+              className="rounded-[22px] bg-white dark:bg-[#11151E] border border-slate-200/80 dark:border-white/[0.07] p-5 space-y-3"
+            >
+              <div className="flex items-center gap-2 text-sm font-bold text-slate-900 dark:text-white">
+                <Route className="w-4 h-4 text-sky-500" />
+                <span>تتبع المسار المباشر (Traceroute)</span>
+              </div>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  required
+                  dir="ltr"
+                  value={traceTarget}
+                  onChange={(e) => setTraceTarget(e.target.value)}
+                  placeholder="1.1.1.1 أو 8.8.8.8"
+                  className="flex-1 min-h-[40px] rounded-xl border border-slate-200 dark:border-white/[0.09] bg-slate-50 dark:bg-[#171C28] px-3 text-xs font-mono"
+                />
+                <button
+                  type="submit"
+                  disabled={traceBusy}
+                  className="min-h-[40px] px-4 rounded-xl bg-sky-600 text-white text-xs font-bold disabled:opacity-60"
+                >
+                  {traceBusy ? 'جاري التتبع...' : 'تتبع'}
+                </button>
+              </div>
+              {traceHops.length > 0 && (
+                <div className="max-h-40 overflow-y-auto space-y-1 text-xs font-mono" dir="ltr">
+                  {traceHops.map((h) => (
+                    <div key={h.hop} className="flex items-center justify-between rounded-lg bg-slate-50 dark:bg-[#171C28] px-3 py-1.5">
+                      <span>#{h.hop} {h.address}</span>
+                      <span className="text-sky-500">{h.avgMs} ms (loss {h.lossPct}%)</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </form>
+          </div>
+
+          {/* Multi-WAN Routes & Live Latency Matrix (#66, #72, #73) */}
+          <div className="rounded-[22px] bg-white dark:bg-[#11151E] border border-slate-200/80 dark:border-white/[0.07] p-5 space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2 text-sm font-bold text-slate-900 dark:text-white">
+                <Globe className="w-4 h-4 text-sky-500" />
+                <span>تعدد المزودين (Multi-WAN) ومصفوفة Latency وسجل Failover</span>
+              </div>
+              <button
+                type="button"
+                disabled={probeBusy}
+                onClick={() => void handleProbeLatency()}
+                className="min-h-[38px] px-4 rounded-xl bg-sky-600 text-white text-xs font-bold inline-flex items-center gap-1.5 disabled:opacity-60"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${probeBusy ? 'animate-spin' : ''}`} />
+                <span>فحص بنج 1.1.1.1 / 8.8.8.8 / 9.9.9.9</span>
+              </button>
+            </div>
+
+            {latencyProbes.length > 0 && (
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 text-xs">
+                {['1.1.1.1', '8.8.8.8', '9.9.9.9'].map((ip) => {
+                  const latest = latencyProbes.find((p) => p.target === ip);
+                  return (
+                    <div key={ip} className="rounded-xl bg-slate-50 dark:bg-[#171C28] p-3 flex items-center justify-between">
+                      <div>
+                        <div className="font-mono font-bold text-slate-900 dark:text-white" dir="ltr">{ip}</div>
+                        <div className="text-[11px] text-slate-400">{latest?.label || 'DNS Probe'}</div>
+                      </div>
+                      <div className="text-left font-mono" dir="ltr">
+                        <div className={`font-bold ${latest?.latencyMs != null ? 'text-emerald-500' : 'text-red-500'}`}>
+                          {latest?.latencyMs != null ? `${latest.latencyMs} ms` : 'Timeout'}
+                        </div>
+                        <div className="text-[10px] text-slate-400">Loss {latest?.packetLossPct ?? 0}%</div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {diagnostics?.routes && diagnostics.routes.length > 0 && (
+              <div className="space-y-1.5">
+                <div className="text-xs font-bold text-slate-500">المسارات النشطة / الاحتياطية على الراوتر:</div>
+                {diagnostics.routes.slice(0, 8).map((rt, idx) => (
+                  <div
+                    key={rt.id || idx}
+                    className="rounded-xl bg-slate-50 dark:bg-[#171C28] px-3 py-2 flex flex-wrap items-center justify-between gap-2 text-xs font-mono"
+                    dir="ltr"
+                  >
+                    <div>
+                      <span className="font-bold text-slate-900 dark:text-white">{rt.dst}</span>{' '}
+                      <span className="text-sky-500">via {rt.gateway}</span>{' '}
+                      <span className="text-slate-400">dist={rt.distance} {rt.comment ? `(${rt.comment})` : ''}</span>
+                    </div>
+                    {rt.id && (
+                      <button
+                        type="button"
+                        onClick={() => void handleToggleRoute(rt.id!, Boolean(rt.disabled), rt.comment)}
+                        className={`font-sans min-h-[30px] px-3 rounded-lg text-[11px] font-bold ${
+                          rt.disabled ? 'bg-emerald-500/15 text-emerald-500' : 'bg-amber-500/15 text-amber-500'
+                        }`}
+                      >
+                        {rt.disabled ? 'تفعيل المسار' : 'تعطيل / تحويل'}
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {failoverEvents.length > 0 && (
+              <div className="space-y-1 pt-2 border-t border-slate-100 dark:border-white/[0.06]">
+                <div className="text-xs font-bold text-slate-500">سجل أحداث Failover الأخيرة:</div>
+                {failoverEvents.slice(0, 6).map((ev) => (
+                  <div key={ev.id} className="text-xs flex items-center justify-between py-1">
+                    <span>{ev.fromGateway} ← {ev.toGateway} ({ev.reason})</span>
+                    <span className="font-mono text-[10px] text-slate-400" dir="ltr">
+                      {ev.createdAt.slice(0, 16).replace('T', ' ')}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Config .rsc Diff Snapshot (#74) */}
+          <div className="rounded-[22px] bg-white dark:bg-[#11151E] border border-slate-200/80 dark:border-white/[0.07] p-5 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2 text-sm font-bold text-slate-900 dark:text-white">
+                <GitCompare className="w-4 h-4 text-indigo-500" />
+                <span>مقارنة تغييرات إعدادات الراوتر (.rsc Line Diff)</span>
+              </div>
+              <button
+                type="button"
+                disabled={diffBusy}
+                onClick={() => void handleCaptureConfigDiff()}
+                className="min-h-[38px] px-4 rounded-xl bg-indigo-600 text-white text-xs font-bold disabled:opacity-60"
+              >
+                {diffBusy ? 'جاري السحب والمقارنة...' : 'التقاط ومقارنة الآن'}
+              </button>
+            </div>
+            {configDiffs.length > 0 && (
+              <div className="space-y-3">
+                <div className="flex flex-wrap gap-2">
+                  {configDiffs.map((df) => (
+                    <button
+                      key={df.id}
+                      type="button"
+                      onClick={() => setActiveDiffId(df.id)}
+                      className={`px-3 py-1.5 rounded-xl text-xs font-bold border ${
+                        activeDiffId === df.id
+                          ? 'bg-indigo-600 border-indigo-600 text-white'
+                          : 'border-slate-200 dark:border-white/[0.08] text-slate-600 dark:text-slate-300'
+                      }`}
+                    >
+                      {df.summary} · {df.createdAt.slice(5, 16).replace('T', ' ')}
+                    </button>
+                  ))}
+                </div>
+                {(() => {
+                  const chosen = configDiffs.find((d) => d.id === activeDiffId) || configDiffs[0];
+                  if (!chosen) return null;
+                  return (
+                    <pre
+                      dir="ltr"
+                      className="rounded-2xl bg-[#070A10] border border-white/[0.08] p-3 text-[11px] font-mono overflow-x-auto max-h-56 text-left space-y-0.5"
+                    >
+                      {chosen.diffLines.map((ln, idx) => (
+                        <div
+                          key={idx}
+                          className={
+                            ln.type === 'add'
+                              ? 'text-emerald-400'
+                              : ln.type === 'del'
+                                ? 'text-red-400'
+                                : 'text-slate-400'
+                          }
+                        >
+                          {ln.type === 'add' ? '+ ' : ln.type === 'del' ? '- ' : '  '}
+                          {ln.text}
+                        </div>
+                      ))}
+                    </pre>
+                  );
+                })()}
+              </div>
+            )}
+          </div>
+
+          {/* Security Audit (#88) + Dual-Homed WireGuard (#80) */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <div className="rounded-[22px] bg-white dark:bg-[#11151E] border border-slate-200/80 dark:border-white/[0.07] p-5 space-y-3">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2 text-sm font-bold text-slate-900 dark:text-white">
+                  <Shield className="w-4 h-4 text-red-500" />
+                  <span>التدقيق الأمني وكشف المستخدمين</span>
+                </div>
+                <button
+                  type="button"
+                  disabled={auditBusy}
+                  onClick={() => void handleRunSecurityAudit()}
+                  className="min-h-[36px] px-3.5 rounded-xl bg-red-600 text-white text-xs font-bold disabled:opacity-60"
+                >
+                  {auditBusy ? 'جاري التدقيق...' : 'فحص الأمان الآن'}
+                </button>
+              </div>
+              {securityAudit && (
+                <div className="space-y-2 text-xs">
+                  <div className="flex items-center justify-between rounded-xl bg-slate-50 dark:bg-[#171C28] p-3">
+                    <span className="font-bold">نقاط أمان الراوتر:</span>
+                    <span
+                      className={`font-mono font-extrabold text-base ${
+                        securityAudit.score >= 80
+                          ? 'text-emerald-500'
+                          : securityAudit.score >= 50
+                            ? 'text-amber-500'
+                            : 'text-red-500'
+                      }`}
+                    >
+                      {securityAudit.score}/100
+                    </span>
+                  </div>
+                  {securityAudit.newAdminUsersDetected.length > 0 && (
+                    <div className="rounded-xl bg-red-500/15 border border-red-500/30 p-2.5 text-red-500 font-bold">
+                      تحذير: تم رصد مستخدمين إداريين جدد: {securityAudit.newAdminUsersDetected.join(', ')}
+                    </div>
+                  )}
+                  <div className="space-y-1.5 max-h-48 overflow-y-auto">
+                    {securityAudit.findings.map((f, i) => (
+                      <div key={i} className="rounded-xl bg-slate-50 dark:bg-[#171C28] p-2.5">
+                        <div
+                          className={`font-bold ${
+                            f.severity === 'critical'
+                              ? 'text-red-500'
+                              : f.severity === 'warning'
+                                ? 'text-amber-500'
+                                : 'text-emerald-500'
+                          }`}
+                        >
+                          {f.title}
+                        </div>
+                        <div className="text-slate-500 text-[11px]">{f.detail}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <form
+              onSubmit={(e) => void handleGenerateDualWg(e)}
+              className="rounded-[22px] bg-white dark:bg-[#11151E] border border-slate-200/80 dark:border-white/[0.07] p-5 space-y-3"
+            >
+              <div className="flex items-center gap-2 text-sm font-bold text-slate-900 dark:text-white">
+                <KeyRound className="w-4 h-4 text-sky-500" />
+                <span>نفق WireGuard احتياطي مزدوج (Dual-Homed VPS)</span>
+              </div>
+              <p className="text-xs text-slate-500">
+                ولّد سكربت واجهة wg-backup ثانٍ على المايكروتك ليبقى الراوتر متصلاً بسيرفر احتياطي تلقائياً عند تعطل المسار الرئيسي.
+              </p>
+              <div className="grid grid-cols-3 gap-2">
+                <input
+                  type="text"
+                  dir="ltr"
+                  value={dualWgEndpoint}
+                  onChange={(e) => setDualWgEndpoint(e.target.value)}
+                  placeholder="Backup VPS IP/Host"
+                  className="col-span-2 min-h-[40px] rounded-xl border border-slate-200 dark:border-white/[0.09] bg-slate-50 dark:bg-[#171C28] px-3 text-xs font-mono"
+                />
+                <input
+                  type="number"
+                  dir="ltr"
+                  value={dualWgPort}
+                  onChange={(e) => setDualWgPort(e.target.value)}
+                  placeholder="51821"
+                  className="min-h-[40px] rounded-xl border border-slate-200 dark:border-white/[0.09] bg-slate-50 dark:bg-[#171C28] px-3 text-xs font-mono"
+                />
+              </div>
+              <button
+                type="submit"
+                className="w-full min-h-[40px] rounded-xl bg-sky-600 text-white text-xs font-bold"
+              >
+                توليد سكربت WireGuard المزدوج
+              </button>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* TAB 8: INFO & BACKUPS (#19) */}
       {activeTab === 'info' && (
         <div className="space-y-5">
           {/* Backup Trigger Card */}
@@ -1880,12 +2674,31 @@ export const RouterDetailView: React.FC<RouterDetailViewProps> = ({
                 </button>
               </div>
 
-              <button
-                type="submit"
-                className="w-full min-h-[48px] rounded-2xl bg-sky-600 hover:bg-sky-500 text-white font-bold text-sm"
-              >
-                حفظ التغييرات
-              </button>
+              <div className="space-y-2.5">
+                <button
+                  type="submit"
+                  className="w-full min-h-[48px] rounded-2xl bg-sky-600 hover:bg-sky-500 text-white font-bold text-sm"
+                >
+                  حفظ التغييرات
+                </button>
+
+                {router.permissionMode === 'full-control' &&
+                  (editingPort.type === 'ether' || editingPort.poeStatus) && (
+                    <button
+                      type="button"
+                      disabled={poeCycling}
+                      onClick={() => void handleCyclePoe()}
+                      className="w-full min-h-[44px] rounded-2xl bg-amber-500/15 hover:bg-amber-500/25 text-amber-500 font-bold text-xs inline-flex items-center justify-center gap-2 disabled:opacity-60"
+                    >
+                      <Power className="w-4 h-4" />
+                      <span>
+                        {poeCycling
+                          ? 'جاري فصل وإعادة الطاقة PoE...'
+                          : `إعادة تشغيل الطاقة (PoE Cycle) على ${editingPort.name}`}
+                      </span>
+                    </button>
+                  )}
+              </div>
             </form>
           </div>
         </div>
@@ -1971,31 +2784,73 @@ export const RouterDetailView: React.FC<RouterDetailViewProps> = ({
                   </span>
                 </div>
               </div>
+            ) : activeDiagKey === 'ntpStatus' ? (
+              <div className="space-y-2 text-sm font-mono">
+                <div className="flex justify-between py-2 border-b border-slate-100 dark:border-white/[0.06]">
+                  <span className="text-slate-500 font-sans">التفعيل</span>
+                  <span className="text-emerald-500">
+                    {diagnostics.ntpStatus?.enabled ? 'مفعّل' : 'معطّل'}
+                  </span>
+                </div>
+                <div className="flex justify-between py-2 border-b border-slate-100 dark:border-white/[0.06]">
+                  <span className="text-slate-500 font-sans">السيرفرات</span>
+                  <span dir="ltr">{diagnostics.ntpStatus?.servers || '—'}</span>
+                </div>
+                <div className="flex justify-between py-2">
+                  <span className="text-slate-500 font-sans">حالة المزامنة</span>
+                  <span dir="ltr">{diagnostics.ntpStatus?.status || '—'}</span>
+                </div>
+              </div>
             ) : (
-              <div className="space-y-2">
-                {(diagnostics[activeDiagKey as keyof DiagnosticDataset] as Array<Record<string, unknown>>).length ===
-                0 ? (
-                  <div className="p-6 text-center text-xs text-slate-400">لا توجد قيود في هذه القائمة على الراوتر</div>
-                ) : (
-                  (diagnostics[activeDiagKey as keyof DiagnosticDataset] as Array<Record<string, unknown>>).map(
-                    (item, idx) => (
-                      <div
-                        key={idx}
-                        className="rounded-2xl bg-slate-50 dark:bg-[#171C28] border border-slate-200/80 dark:border-white/[0.07] p-3.5 text-xs font-mono space-y-1"
-                        dir="ltr"
+              <div className="space-y-3">
+                {activeDiagKey === 'logs' && (
+                  <div className="flex flex-wrap gap-1.5 pb-1">
+                    {['all', 'ppp', 'error', 'warning', 'dhcp', 'system'].map((tp) => (
+                      <button
+                        key={tp}
+                        type="button"
+                        onClick={() => setLogTopicFilter(tp)}
+                        className={`px-3 py-1 rounded-lg text-xs font-mono font-bold ${
+                          logTopicFilter === tp
+                            ? 'bg-sky-600 text-white'
+                            : 'bg-slate-100 dark:bg-[#171C28] text-slate-600 dark:text-slate-300'
+                        }`}
                       >
-                        {Object.entries(item).map(([k, v]) => (
-                          <div key={k} className="flex items-center justify-between gap-4">
-                            <span className="text-slate-400">{k}</span>
-                            <span className="text-slate-900 dark:text-white font-semibold text-right break-all">
-                              {String(v)}
-                            </span>
-                          </div>
-                        ))}
-                      </div>
-                    )
-                  )
+                        {tp === 'all' ? 'الكل' : tp}
+                      </button>
+                    ))}
+                  </div>
                 )}
+                {(() => {
+                  const rawList =
+                    (diagnostics[activeDiagKey as keyof DiagnosticDataset] as Array<Record<string, unknown>> | undefined) ||
+                    [];
+                  const filteredList =
+                    activeDiagKey === 'logs' && logTopicFilter !== 'all'
+                      ? rawList.filter((item) =>
+                          String(item.topics || '').toLowerCase().includes(logTopicFilter)
+                        )
+                      : rawList;
+                  if (filteredList.length === 0) {
+                    return <div className="p-6 text-center text-xs text-slate-400">لا توجد قيود في هذه القائمة على الراوتر</div>;
+                  }
+                  return filteredList.map((item, idx) => (
+                    <div
+                      key={idx}
+                      className="rounded-2xl bg-slate-50 dark:bg-[#171C28] border border-slate-200/80 dark:border-white/[0.07] p-3.5 text-xs font-mono space-y-1"
+                      dir="ltr"
+                    >
+                      {Object.entries(item).map(([k, v]) => (
+                        <div key={k} className="flex items-center justify-between gap-4">
+                          <span className="text-slate-400">{k}</span>
+                          <span className="text-slate-900 dark:text-white font-semibold text-right break-all">
+                            {Array.isArray(v) ? v.join(', ') : String(v)}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  ));
+                })()}
               </div>
             )}
           </div>
@@ -2225,6 +3080,20 @@ export const RouterDetailView: React.FC<RouterDetailViewProps> = ({
             </form>
           </div>
         </div>
+      )}
+
+      {cpeSub && (
+        <CpeDetailModal
+          token={token}
+          subscriber={cpeSub}
+          onClose={() => setCpeSub(null)}
+          onUpdateSubscriber={
+            onUpdateSubscriber ||
+            (async () => {
+              // No-op fallback if opened standalone
+            })
+          }
+        />
       )}
     </div>
   );

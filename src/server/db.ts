@@ -224,7 +224,164 @@ db.exec(`
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS rf_radios (
+    id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    router_id TEXT,
+    tower_id TEXT,
+    name TEXT NOT NULL,
+    host TEXT NOT NULL,
+    vendor TEXT NOT NULL DEFAULT 'mikrotik',
+    protocol TEXT NOT NULL DEFAULT 'ros',
+    port INTEGER NOT NULL DEFAULT 8728,
+    username TEXT NOT NULL DEFAULT 'admin',
+    secret_enc TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending',
+    last_error TEXT,
+    model TEXT,
+    ssid TEXT,
+    frequency_mhz INTEGER,
+    channel_width_mhz INTEGER,
+    tx_power_dbm INTEGER,
+    ccq_pct INTEGER,
+    airtime_pct INTEGER,
+    signal_dbm INTEGER,
+    noise_floor_dbm INTEGER,
+    snr_db INTEGER,
+    chain0_dbm INTEGER,
+    chain1_dbm INTEGER,
+    chain_imbalance_db INTEGER,
+    tx_rate_mbps REAL,
+    rx_rate_mbps REAL,
+    distance_km REAL,
+    lan_speed TEXT,
+    clients_json TEXT NOT NULL DEFAULT '[]',
+    last_sync TEXT,
+    created_at TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS rf_signal_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    radio_id TEXT NOT NULL,
+    signal_dbm INTEGER,
+    noise_floor_dbm INTEGER,
+    ccq_pct INTEGER,
+    airtime_pct INTEGER,
+    recorded_at TEXT NOT NULL,
+    FOREIGN KEY(radio_id) REFERENCES rf_radios(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS cpe_devices (
+    subscriber_id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'unconfigured',
+    tr069_device_id TEXT,
+    cpe_host TEXT,
+    cpe_port INTEGER NOT NULL DEFAULT 80,
+    cpe_user TEXT NOT NULL DEFAULT '',
+    cpe_pass_enc TEXT NOT NULL DEFAULT '',
+    model TEXT,
+    serial_number TEXT,
+    firmware TEXT,
+    uptime_sec INTEGER,
+    cpu_pct INTEGER,
+    ram_pct INTEGER,
+    wan_ip TEXT,
+    wifi_ssid_24 TEXT,
+    wifi_channel_24 TEXT,
+    wifi_ssid_5 TEXT,
+    wifi_channel_5 TEXT,
+    connected_count INTEGER NOT NULL DEFAULT 0,
+    connected_hosts_json TEXT NOT NULL DEFAULT '[]',
+    tr143_down_mbps REAL,
+    tr143_up_mbps REAL,
+    last_config_backup_json TEXT,
+    last_synced_at TEXT,
+    FOREIGN KEY(subscriber_id) REFERENCES subscribers(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS subscriber_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_id TEXT NOT NULL,
+    subscriber_id TEXT NOT NULL,
+    ip TEXT NOT NULL DEFAULT '',
+    mac TEXT NOT NULL DEFAULT '',
+    login_at TEXT NOT NULL,
+    logout_at TEXT,
+    duration_sec INTEGER NOT NULL DEFAULT 0,
+    rx_gb REAL NOT NULL DEFAULT 0,
+    tx_gb REAL NOT NULL DEFAULT 0,
+    disconnect_cause TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY(subscriber_id) REFERENCES subscribers(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS latency_probes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_id TEXT NOT NULL,
+    router_id TEXT NOT NULL,
+    target TEXT NOT NULL,
+    label TEXT NOT NULL,
+    latency_ms REAL,
+    packet_loss_pct INTEGER NOT NULL DEFAULT 0,
+    recorded_at TEXT NOT NULL,
+    FOREIGN KEY(router_id) REFERENCES routers(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS failover_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_id TEXT NOT NULL,
+    router_id TEXT NOT NULL,
+    router_name TEXT NOT NULL,
+    from_gateway TEXT NOT NULL,
+    to_gateway TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(router_id) REFERENCES routers(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS config_diffs (
+    id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    router_id TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    added_count INTEGER NOT NULL DEFAULT 0,
+    removed_count INTEGER NOT NULL DEFAULT 0,
+    raw_rsc TEXT NOT NULL,
+    diff_lines_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(router_id) REFERENCES routers(id) ON DELETE CASCADE
+  );
 `);
+
+function tryAddColumn(table: string, colDef: string): void {
+  try {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${colDef}`);
+  } catch {
+    // Column already exists
+  }
+}
+
+// Idempotent column migrations for existing bro-radius.db databases
+tryAddColumn('users', "allowed_tower_ids_json TEXT NOT NULL DEFAULT '[]'");
+tryAddColumn('subscribers', 'grace_expires_at TEXT');
+tryAddColumn('subscribers', 'turbo_night_enabled INTEGER NOT NULL DEFAULT 0');
+tryAddColumn('subscribers', 'turbo_profile TEXT');
+tryAddColumn('subscribers', 'base_profile TEXT');
+tryAddColumn('subscribers', 'static_ip_pool TEXT');
+tryAddColumn('subscribers', 'rf_radio_id TEXT');
+tryAddColumn('subscribers', 'signal_dbm INTEGER');
+tryAddColumn('subscribers', 'distance_km REAL');
+tryAddColumn('notification_settings', 'turbo_night_enabled INTEGER NOT NULL DEFAULT 0');
+tryAddColumn('notification_settings', 'turbo_start_hour INTEGER NOT NULL DEFAULT 1');
+tryAddColumn('notification_settings', 'turbo_end_hour INTEGER NOT NULL DEFAULT 7');
+tryAddColumn('notification_settings', "turbo_default_profile TEXT NOT NULL DEFAULT ''");
+tryAddColumn('notification_settings', "genieacs_url TEXT NOT NULL DEFAULT ''");
+tryAddColumn('notification_settings', "genieacs_user TEXT NOT NULL DEFAULT ''");
+tryAddColumn('notification_settings', "genieacs_pass_enc TEXT NOT NULL DEFAULT ''");
+tryAddColumn('notification_settings', "radius_host TEXT NOT NULL DEFAULT ''");
+tryAddColumn('notification_settings', 'radius_coa_port INTEGER NOT NULL DEFAULT 3799');
+tryAddColumn('notification_settings', "radius_secret_enc TEXT NOT NULL DEFAULT ''");
 
 export function getNextTunnelOctet(): number {
   const row = db.prepare('SELECT value FROM app_meta WHERE key = ?').get('next_tunnel_octet') as
@@ -239,9 +396,13 @@ export function getNextTunnelOctet(): number {
 }
 
 export function runRetentionCleanup(): void {
+  const cutoff7d = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
   const cutoff30d = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
   const cutoff90d = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
   db.prepare('DELETE FROM port_traffic_history WHERE recorded_at < ?').run(cutoff30d);
+  db.prepare('DELETE FROM rf_signal_history WHERE recorded_at < ?').run(cutoff30d);
+  db.prepare('DELETE FROM latency_probes WHERE recorded_at < ?').run(cutoff7d);
   db.prepare('DELETE FROM audit_logs WHERE created_at < ?').run(cutoff90d);
   db.prepare('DELETE FROM alerts WHERE acknowledged = 1 AND created_at < ?').run(cutoff30d);
 }
+

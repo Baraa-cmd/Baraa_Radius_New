@@ -13,6 +13,7 @@ import {
   Phone,
   Plus,
   Radio,
+  Ruler,
   Search,
   Trash2,
   X,
@@ -64,6 +65,25 @@ function computeSectorPolygon(
   return pts;
 }
 
+function haversineKm(lat1: number, lng1: number, lat2: number, lng2: number): number {
+  const R = 6371;
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLng = ((lng2 - lng1) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function bearingDeg(lat1: number, lng1: number, lat2: number, lng2: number): number {
+  const f1 = (lat1 * Math.PI) / 180;
+  const f2 = (lat2 * Math.PI) / 180;
+  const dl = ((lng2 - lng1) * Math.PI) / 180;
+  const y = Math.sin(dl) * Math.cos(f2);
+  const x = Math.cos(f1) * Math.sin(f2) - Math.sin(f1) * Math.cos(f2) * Math.cos(dl);
+  return ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
+}
+
 export const SubscribersMapView: React.FC<SubscribersMapViewProps> = ({
   subscribers,
   towers,
@@ -84,6 +104,12 @@ export const SubscribersMapView: React.FC<SubscribersMapViewProps> = ({
   const [clustered, setClustered] = useState(false);
   const [showHeatmap, setShowHeatmap] = useState(false);
   const [showTowerModal, setShowTowerModal] = useState(false);
+  const [showFresnelModal, setShowFresnelModal] = useState(false);
+  const [fresnelTowerId, setFresnelTowerId] = useState('');
+  const [fresnelSubId, setFresnelSubId] = useState('');
+  const [fresnelFreqGhz, setFresnelFreqGhz] = useState('5.8');
+  const [fresnelTowerMastM, setFresnelTowerMastM] = useState('18');
+  const [fresnelCpeMastM, setFresnelCpeMastM] = useState('8');
 
   const [towerName, setTowerName] = useState('');
   const [towerLat, setTowerLat] = useState('33.3260');
@@ -227,9 +253,14 @@ export const SubscribersMapView: React.FC<SubscribersMapViewProps> = ({
         fillOpacity: 0.14,
       }).addTo(group);
 
+      const health = typeof tower.healthScore === 'number' ? tower.healthScore : null;
+      const healthBadge =
+        health !== null
+          ? `<span style="margin-right:4px;color:${health >= 80 ? '#10B981' : health >= 50 ? '#F59E0B' : '#EF4444'}">${health}%</span>`
+          : '';
       const towerIcon = L.divIcon({
         className: 'bro-tower-icon',
-        html: `<div style="padding:4px 8px;border-radius:10px;background:#0F172A;color:#38BDF8;border:2px solid #0EA5E9;font-size:11px;font-weight:800;white-space:nowrap;box-shadow:0 4px 12px rgba(0,0,0,0.4);">📡 ${tower.name}</div>`,
+        html: `<div style="padding:4px 8px;border-radius:10px;background:#0F172A;color:#38BDF8;border:2px solid #0EA5E9;font-size:11px;font-weight:800;white-space:nowrap;box-shadow:0 4px 12px rgba(0,0,0,0.4);">📡 ${tower.name} ${healthBadge}</div>`,
         iconSize: [28, 28],
         iconAnchor: [14, 14],
       });
@@ -379,6 +410,20 @@ export const SubscribersMapView: React.FC<SubscribersMapViewProps> = ({
                 className="w-full min-h-[46px] rounded-2xl border border-slate-200/90 dark:border-white/[0.1] bg-white/95 dark:bg-[#11151E]/95 backdrop-blur-md pr-11 pl-4 text-sm text-slate-900 dark:text-white shadow-lg focus:outline-none focus:border-sky-500"
               />
             </div>
+
+            <button
+              type="button"
+              onClick={() => {
+                if (!fresnelTowerId && towers[0]) setFresnelTowerId(towers[0].id);
+                if (!fresnelSubId && geoSubscribers[0]) setFresnelSubId(geoSubscribers[0].id);
+                setShowFresnelModal(true);
+              }}
+              className="min-h-[46px] px-3.5 rounded-2xl bg-white/95 dark:bg-[#11151E]/95 border border-slate-200/90 dark:border-white/[0.1] text-slate-800 dark:text-slate-100 text-xs font-bold shadow-lg inline-flex items-center gap-1.5 whitespace-nowrap"
+              title="حساب خط النظر ومنطقة فرينل LoS / Fresnel"
+            >
+              <Ruler className="w-4 h-4 text-teal-500" />
+              <span className="hidden sm:inline">خط النظر LoS</span>
+            </button>
 
             <button
               type="button"
@@ -698,28 +743,224 @@ export const SubscribersMapView: React.FC<SubscribersMapViewProps> = ({
 
             {towers.length > 0 && (
               <div className="divide-y divide-slate-200 dark:divide-white/[0.07] pt-2">
-                {towers.map((t) => (
-                  <div key={t.id} className="py-2.5 flex items-center justify-between text-xs">
-                    <div>
-                      <div className="font-bold text-slate-900 dark:text-white">{t.name}</div>
-                      <div className="font-mono text-slate-500" dir="ltr">
-                        {t.lat}, {t.lng} · {t.azimuthDeg}° ({t.beamwidthDeg}°)
+                {towers.map((t) => {
+                  const hs = typeof t.healthScore === 'number' ? t.healthScore : 100;
+                  const hsColor =
+                    hs >= 80
+                      ? 'bg-emerald-500/15 text-emerald-500'
+                      : hs >= 50
+                        ? 'bg-amber-500/15 text-amber-500'
+                        : 'bg-red-500/15 text-red-500';
+                  return (
+                    <div key={t.id} className="py-2.5 flex items-center justify-between text-xs gap-2">
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <span className="font-bold text-slate-900 dark:text-white">{t.name}</span>
+                          <span className={`font-mono font-bold text-[10px] px-2 py-0.5 rounded-md ${hsColor}`}>
+                            صحة {hs}%
+                          </span>
+                        </div>
+                        <div className="font-mono text-slate-500 mt-0.5" dir="ltr">
+                          {t.lat}, {t.lng} · {t.azimuthDeg}° ({t.beamwidthDeg}°) · RF {t.onlineRadios ?? 0}/{t.totalRadios ?? 0} · Subs {t.onlineSubs ?? 0}/{t.totalSubs ?? 0}
+                        </div>
                       </div>
+                      <button
+                        type="button"
+                        onClick={() => void onDeleteTower(t.id)}
+                        className="p-2 text-slate-400 hover:text-red-500 shrink-0"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
                     </div>
-                    <button
-                      type="button"
-                      onClick={() => void onDeleteTower(t.id)}
-                      className="p-2 text-slate-400 hover:text-red-500"
-                    >
-                      <Trash2 className="w-4 h-4" />
-                    </button>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
           </div>
         </div>
       )}
+
+      {/* Line-of-Sight & 1st Fresnel Zone Calculator Modal (#94) */}
+      {showFresnelModal && (() => {
+        const twr = towers.find((t) => t.id === fresnelTowerId) || towers[0] || null;
+        const sub = geoSubscribers.find((s) => s.id === fresnelSubId) || geoSubscribers[0] || null;
+        const freq = Math.max(0.9, Number(fresnelFreqGhz) || 5.8);
+        const hTower = Math.max(1, Number(fresnelTowerMastM) || 18);
+        const hCpe = Math.max(1, Number(fresnelCpeMastM) || 8);
+        const distKm =
+          twr && sub && sub.lat !== null && sub.lng !== null
+            ? haversineKm(twr.lat, twr.lng, sub.lat, sub.lng)
+            : 0;
+        const azimuth =
+          twr && sub && sub.lat !== null && sub.lng !== null
+            ? bearingDeg(twr.lat, twr.lng, sub.lat, sub.lng)
+            : 0;
+        const fresnelRadiusM = distKm > 0 ? 17.32 * Math.sqrt(distKm / (4 * freq)) : 0;
+        const clear60PctM = fresnelRadiusM * 0.6;
+        const earthBulgeM = (distKm * distKm) / 67.9;
+        const midHeightM = (hTower + hCpe) / 2;
+        const netClearanceM = midHeightM - clear60PctM - earthBulgeM;
+
+        return (
+          <div className="fixed inset-0 z-[500] flex items-end sm:items-center justify-center bg-black/75 backdrop-blur-sm sm:p-4">
+            <div className="w-full max-w-xl max-h-[90vh] overflow-y-auto rounded-t-3xl sm:rounded-3xl bg-white dark:bg-[#11151E] border border-slate-200/80 dark:border-white/[0.08] p-6 shadow-2xl space-y-4">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Ruler className="w-5 h-5 text-teal-500" />
+                  <h3 className="text-base font-bold text-slate-900 dark:text-white">
+                    حاسبة خط النظر والمنطقة الحرة الأولى (Fresnel LoS)
+                  </h3>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowFresnelModal(false)}
+                  className="min-w-[40px] min-h-[40px] flex items-center justify-center rounded-xl text-slate-500"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              {towers.length === 0 || geoSubscribers.length === 0 ? (
+                <div className="rounded-2xl border border-dashed border-slate-300 dark:border-white/[0.12] p-6 text-center text-xs text-slate-500">
+                  أضف برجاً وحدد إحداثيات مشترك واحد على الأقل لحساب المسافة وزاوية التوجيه ومنطقة Fresnel.
+                </div>
+              ) : (
+                <>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-[11px] font-bold text-slate-500 mb-1">البرج المرسل</label>
+                      <select
+                        value={twr?.id || ''}
+                        onChange={(e) => setFresnelTowerId(e.target.value)}
+                        className="w-full min-h-[42px] rounded-xl border border-slate-200 dark:border-white/[0.09] bg-slate-50 dark:bg-[#171C28] px-3 text-xs font-bold text-slate-900 dark:text-white"
+                      >
+                        {towers.map((t) => (
+                          <option key={t.id} value={t.id}>
+                            {t.name}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-[11px] font-bold text-slate-500 mb-1">المشترك الهدف</label>
+                      <select
+                        value={sub?.id || ''}
+                        onChange={(e) => setFresnelSubId(e.target.value)}
+                        className="w-full min-h-[42px] rounded-xl border border-slate-200 dark:border-white/[0.09] bg-slate-50 dark:bg-[#171C28] px-3 text-xs font-bold text-slate-900 dark:text-white"
+                      >
+                        {geoSubscribers.map((s) => (
+                          <option key={s.id} value={s.id}>
+                            {s.username} ({s.fullName})
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-3 gap-2.5">
+                    <div>
+                      <label className="block text-[11px] font-bold text-slate-500 mb-1">التردد (GHz)</label>
+                      <select
+                        value={fresnelFreqGhz}
+                        onChange={(e) => setFresnelFreqGhz(e.target.value)}
+                        className="w-full min-h-[40px] rounded-xl border border-slate-200 dark:border-white/[0.09] bg-slate-50 dark:bg-[#171C28] px-2.5 text-xs font-mono text-slate-900 dark:text-white"
+                      >
+                        <option value="2.4">2.4 GHz</option>
+                        <option value="5.8">5.8 GHz</option>
+                        <option value="6.0">6 GHz</option>
+                        <option value="24">24 GHz</option>
+                        <option value="60">60 GHz</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-[11px] font-bold text-slate-500 mb-1">ارتفاع البرج (م)</label>
+                      <input
+                        type="number"
+                        min={1}
+                        dir="ltr"
+                        value={fresnelTowerMastM}
+                        onChange={(e) => setFresnelTowerMastM(e.target.value)}
+                        className="w-full min-h-[40px] rounded-xl border border-slate-200 dark:border-white/[0.09] bg-slate-50 dark:bg-[#171C28] px-2.5 text-xs font-mono text-slate-900 dark:text-white"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[11px] font-bold text-slate-500 mb-1">ارتفاع النانو (م)</label>
+                      <input
+                        type="number"
+                        min={1}
+                        dir="ltr"
+                        value={fresnelCpeMastM}
+                        onChange={(e) => setFresnelCpeMastM(e.target.value)}
+                        className="w-full min-h-[40px] rounded-xl border border-slate-200 dark:border-white/[0.09] bg-slate-50 dark:bg-[#171C28] px-2.5 text-xs font-mono text-slate-900 dark:text-white"
+                      />
+                    </div>
+                  </div>
+
+                  {/* SVG Fresnel Visualization */}
+                  <div className="rounded-2xl bg-[#070A10] border border-white/[0.08] p-4">
+                    <svg viewBox="0 0 420 110" className="w-full h-28">
+                      <line x1="20" y1="95" x2="400" y2="95" stroke="#334155" strokeWidth="2" />
+                      <line x1="40" y1="95" x2="40" y2="28" stroke="#0EA5E9" strokeWidth="4" />
+                      <line x1="380" y1="95" x2="380" y2="54" stroke="#10B981" strokeWidth="4" />
+                      <ellipse
+                        cx="210"
+                        cy="41"
+                        rx="170"
+                        ry={Math.min(34, Math.max(8, fresnelRadiusM * 2.2))}
+                        fill="rgba(14,165,233,0.14)"
+                        stroke="#38BDF8"
+                        strokeDasharray="4 4"
+                      />
+                      <line x1="40" y1="28" x2="380" y2="54" stroke="#F59E0B" strokeWidth="2" />
+                      <text x="40" y="20" fill="#38BDF8" fontSize="9" textAnchor="middle">
+                        برج ({hTower}m)
+                      </text>
+                      <text x="380" y="46" fill="#10B981" fontSize="9" textAnchor="middle">
+                        CPE ({hCpe}m)
+                      </text>
+                      <text x="210" y="18" fill="#E2E8F0" fontSize="10" textAnchor="middle">
+                        {distKm.toFixed(2)} km · {Math.round(azimuth)}°
+                      </text>
+                    </svg>
+                  </div>
+
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 text-xs">
+                    <div className="rounded-xl bg-slate-50 dark:bg-[#171C28] p-3">
+                      <div className="text-slate-500">المسافة المباشرة</div>
+                      <div className="font-mono font-extrabold text-sky-500 mt-0.5" dir="ltr">
+                        {distKm.toFixed(2)} km
+                      </div>
+                    </div>
+                    <div className="rounded-xl bg-slate-50 dark:bg-[#171C28] p-3">
+                      <div className="text-slate-500">زاوية البوصلة</div>
+                      <div className="font-mono font-extrabold text-indigo-400 mt-0.5" dir="ltr">
+                        {Math.round(azimuth)}°
+                      </div>
+                    </div>
+                    <div className="rounded-xl bg-slate-50 dark:bg-[#171C28] p-3">
+                      <div className="text-slate-500">خلوص 60% Fresnel</div>
+                      <div className="font-mono font-extrabold text-amber-500 mt-0.5" dir="ltr">
+                        ±{clear60PctM.toFixed(1)} m
+                      </div>
+                    </div>
+                    <div className="rounded-xl bg-slate-50 dark:bg-[#171C28] p-3">
+                      <div className="text-slate-500">صافي الارتفاع المتاح</div>
+                      <div
+                        className={`font-mono font-extrabold mt-0.5 ${
+                          netClearanceM >= 2 ? 'text-emerald-500' : 'text-red-500'
+                        }`}
+                        dir="ltr"
+                      >
+                        {netClearanceM.toFixed(1)} m
+                      </div>
+                    </div>
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 };

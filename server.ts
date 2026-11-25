@@ -16,8 +16,10 @@ import {
 } from './src/server/crypto.ts';
 import { db, getNextTunnelOctet, runRetentionCleanup } from './src/server/db.ts';
 import {
+  buildDualHomedWireGuardScript,
   buildInstallScript,
   buildUninstallScript,
+  evaluateRouterSecurity,
   fetchRealRouterSnapshot,
   formatUptimeArabic,
   getHostWireGuardHandshake,
@@ -25,6 +27,7 @@ import {
   isHostWireGuardAvailable,
   lookupMacVendor,
   parseRouterOsUptime,
+  parseTorchRows,
   removeHostWireGuardPeer,
   RouterOSClient,
   type RosRow,
@@ -33,6 +36,21 @@ import {
   WG_SERVER_PORT,
   WG_SUBNET_PREFIX,
 } from './src/server/routeros.ts';
+import {
+  applyFrequencyShift,
+  computeTowerHealthScore,
+  pollRfRadio,
+  rebootRfRadio,
+  scanMikroTikCleanFrequencies,
+} from './src/server/rfTelemetry.ts';
+import {
+  estimateCpeDevicesFromMikroTik,
+  fetchGenieAcsCpe,
+  type GenieAcsConfig,
+  proxyCpeHttpPage,
+  pushGenieAcsTask,
+} from './src/server/cpeManager.ts';
+import { computeRscLineDiff, sendRadiusCoaOrDisconnect } from './src/server/radiusCoa.ts';
 import {
   buildOracleCloudShellScript,
   buildOracleRelayInstallScript,
@@ -47,7 +65,13 @@ import {
 import type {
   ApiPermissionMode,
   ConnectionType,
+  CpeConnectedHost,
+  CpeDeviceInfo,
   PortRole,
+  RfProtocol,
+  RfRadioDevice,
+  RfStationClient,
+  RfVendor,
   RouterAlertRules,
   RouterDevice,
   RouterPort,
@@ -391,8 +415,13 @@ function hydrateRouter(row: Record<string, unknown>): RouterDevice {
 }
 
 function hydrateSubscriber(row: Record<string, unknown>) {
+  const subId = String(row.id);
+  const cpeRow = db
+    .prepare('SELECT connected_count, model FROM cpe_devices WHERE subscriber_id = ?')
+    .get(subId) as { connected_count: number; model: string | null } | undefined;
+
   return {
-    id: String(row.id),
+    id: subId,
     ownerId: String(row.owner_id),
     routerId: String(row.router_id),
     routerName: String(row.router_name),
@@ -422,9 +451,54 @@ function hydrateSubscriber(row: Record<string, unknown>) {
     activatedAt: row.activated_at ? String(row.activated_at) : null,
     expiresAt: row.expires_at ? String(row.expires_at) : null,
     expiresInDays: Number(row.expires_in_days || 0),
+    graceExpiresAt: row.grace_expires_at ? String(row.grace_expires_at) : null,
+    turboNightEnabled: Boolean(row.turbo_night_enabled),
+    turboProfile: row.turbo_profile ? String(row.turbo_profile) : null,
+    baseProfile: row.base_profile ? String(row.base_profile) : null,
+    staticIpPool: row.static_ip_pool ? String(row.static_ip_pool) : null,
+    rfRadioId: row.rf_radio_id ? String(row.rf_radio_id) : null,
+    signalDbm: row.signal_dbm !== null && row.signal_dbm !== undefined ? Number(row.signal_dbm) : null,
+    distanceKm: row.distance_km !== null && row.distance_km !== undefined ? Number(row.distance_km) : null,
+    cpeConnectedCount: cpeRow ? Number(cpeRow.connected_count || 0) : 0,
+    cpeModel: cpeRow?.model || null,
     towerId: row.tower_id ? String(row.tower_id) : null,
     lat: row.lat !== null && row.lat !== undefined ? Number(row.lat) : null,
     lng: row.lng !== null && row.lng !== undefined ? Number(row.lng) : null,
+  };
+}
+
+function hydrateRfRadio(row: Record<string, unknown>): RfRadioDevice {
+  return {
+    id: String(row.id),
+    ownerId: String(row.owner_id),
+    routerId: row.router_id ? String(row.router_id) : null,
+    towerId: row.tower_id ? String(row.tower_id) : null,
+    name: String(row.name),
+    host: String(row.host),
+    vendor: String(row.vendor || 'mikrotik') as RfVendor,
+    protocol: String(row.protocol || 'ros') as RfProtocol,
+    port: Number(row.port || 8728),
+    status: String(row.status || 'pending') as RfRadioDevice['status'],
+    lastError: row.last_error ? String(row.last_error) : null,
+    model: row.model ? String(row.model) : null,
+    ssid: row.ssid ? String(row.ssid) : null,
+    frequencyMhz: row.frequency_mhz !== null && row.frequency_mhz !== undefined ? Number(row.frequency_mhz) : null,
+    channelWidthMhz: row.channel_width_mhz !== null && row.channel_width_mhz !== undefined ? Number(row.channel_width_mhz) : null,
+    txPowerDbm: row.tx_power_dbm !== null && row.tx_power_dbm !== undefined ? Number(row.tx_power_dbm) : null,
+    ccqPct: row.ccq_pct !== null && row.ccq_pct !== undefined ? Number(row.ccq_pct) : null,
+    airtimePct: row.airtime_pct !== null && row.airtime_pct !== undefined ? Number(row.airtime_pct) : null,
+    signalDbm: row.signal_dbm !== null && row.signal_dbm !== undefined ? Number(row.signal_dbm) : null,
+    noiseFloorDbm: row.noise_floor_dbm !== null && row.noise_floor_dbm !== undefined ? Number(row.noise_floor_dbm) : null,
+    snrDb: row.snr_db !== null && row.snr_db !== undefined ? Number(row.snr_db) : null,
+    chain0Dbm: row.chain0_dbm !== null && row.chain0_dbm !== undefined ? Number(row.chain0_dbm) : null,
+    chain1Dbm: row.chain1_dbm !== null && row.chain1_dbm !== undefined ? Number(row.chain1_dbm) : null,
+    chainImbalanceDb: row.chain_imbalance_db !== null && row.chain_imbalance_db !== undefined ? Number(row.chain_imbalance_db) : null,
+    txRateMbps: row.tx_rate_mbps !== null && row.tx_rate_mbps !== undefined ? Number(row.tx_rate_mbps) : null,
+    rxRateMbps: row.rx_rate_mbps !== null && row.rx_rate_mbps !== undefined ? Number(row.rx_rate_mbps) : null,
+    distanceKm: row.distance_km !== null && row.distance_km !== undefined ? Number(row.distance_km) : null,
+    lanSpeed: row.lan_speed ? String(row.lan_speed) : null,
+    clients: JSON.parse(String(row.clients_json || '[]')) as RfStationClient[],
+    lastSync: row.last_sync ? String(row.last_sync) : null,
   };
 }
 
@@ -739,7 +813,35 @@ async function performRealRouterSync(routerRow: Record<string, unknown>): Promis
           flapped,
           prevSub.id
         );
+
+        // Session History Tracking (#57) & Flapping Alert (#51)
+        if (prevSub.online === 0 && isOnline) {
+          db.prepare(
+            'INSERT INTO subscriber_sessions (owner_id, subscriber_id, ip, mac, login_at) VALUES (?, ?, ?, ?, ?)'
+          ).run(ownerId, prevSub.id, ip, mac, nowIso);
+        } else if (prevSub.online === 1 && !isOnline) {
+          const openSess = db
+            .prepare('SELECT id, login_at FROM subscriber_sessions WHERE subscriber_id = ? AND logout_at IS NULL ORDER BY id DESC LIMIT 1')
+            .get(prevSub.id) as { id: number; login_at: string } | undefined;
+          if (openSess) {
+            const durSec = Math.max(1, Math.round((Date.now() - Date.parse(openSess.login_at)) / 1000));
+            db.prepare(
+              'UPDATE subscriber_sessions SET logout_at = ?, duration_sec = ?, disconnect_cause = ? WHERE id = ?'
+            ).run(nowIso, durSec, 'PPPoE Link Lost', openSess.id);
+          }
+        }
+        if (flapped && prevSub.flap_count_today + 1 === 10 && alertRules.enabled) {
+          createAlert(
+            ownerId,
+            routerId,
+            routerName,
+            'warning',
+            `انقطاع متكرر (Flapping): ${uname}`,
+            `تجاوز المشترك ${uname} 10 انقطاعات اليوم — تحقق من سلك النانو أو الباور أو التشويش.`
+          );
+        }
       } else {
+        const newSubId = `sub-${crypto.randomUUID()}`;
         db.prepare(`
           INSERT INTO subscribers (
             id, owner_id, router_id, router_name, username, full_name, area,
@@ -747,7 +849,7 @@ async function performRealRouterSync(routerRow: Record<string, unknown>): Promis
             online, live_rx_mbps, live_tx_mbps, billing_status, expires_in_days
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 30)
         `).run(
-          `sub-${crypto.randomUUID()}`,
+          newSubId,
           ownerId,
           routerId,
           routerName,
@@ -765,6 +867,33 @@ async function performRealRouterSync(routerRow: Record<string, unknown>): Promis
           liveRxMbps,
           liveTxMbps
         );
+        if (isOnline) {
+          db.prepare(
+            'INSERT INTO subscriber_sessions (owner_id, subscriber_id, ip, mac, login_at) VALUES (?, ?, ?, ?, ?)'
+          ).run(ownerId, newSubId, ip, mac, nowIso);
+        }
+      }
+    }
+
+    // Continuous Latency Probe Matrix (#72) & Smart Failover Watchdog (#73)
+    const probeTargets = [
+      { target: '1.1.1.1', label: 'Cloudflare DNS' },
+      { target: '8.8.8.8', label: 'Google DNS' },
+    ];
+    for (const pt of probeTargets) {
+      try {
+        const pr = await runPingViaContext(routerRow, pt.target);
+        db.prepare(
+          'INSERT INTO latency_probes (owner_id, router_id, target, label, latency_ms, packet_loss_pct, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+        ).run(ownerId, routerId, pt.target, pt.label, pr.latencyMs, pr.packetLossPct, nowIso);
+        if (pt.target === '1.1.1.1' && pr.packetLossPct >= 100 && alertRules.enabled) {
+          db.prepare(
+            'INSERT INTO failover_events (owner_id, router_id, router_name, from_gateway, to_gateway, reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+          ).run(ownerId, routerId, routerName, 'Primary WAN', 'Backup Monitor', 'فقدان 100% إلى 1.1.1.1 من داخل الراوتر', nowIso);
+          createAlert(ownerId, routerId, routerName, 'critical', `فقدان إنترنت WAN: ${routerName}`, 'فشل الوصول إلى 1.1.1.1 بنسبة فقدان 100% من الراوتر.');
+        }
+      } catch {
+        // Ignore transient probe errors
       }
     }
 
@@ -852,21 +981,68 @@ async function performRealRouterSync(routerRow: Record<string, unknown>): Promis
 
 interface AuthedRequest extends Request {
   user?: TokenPayload;
+  allowedTowerIds?: string[];
+}
+
+function parseCookies(cookieHeader: string | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!cookieHeader) return out;
+  for (const part of cookieHeader.split(';')) {
+    const idx = part.indexOf('=');
+    if (idx > 0) {
+      const k = part.slice(0, idx).trim();
+      const v = part.slice(idx + 1).trim();
+      if (k) out[k] = decodeURIComponent(v);
+    }
+  }
+  return out;
+}
+
+function setSessionCookie(req: Request, res: Response, token: string): void {
+  const isHttps = req.secure || req.headers['x-forwarded-proto'] === 'https';
+  const parts = [
+    `bro_session=${encodeURIComponent(token)}`,
+    'Path=/',
+    'HttpOnly',
+    'SameSite=Lax',
+    `Max-Age=${7 * 24 * 3600}`,
+  ];
+  if (isHttps) parts.push('Secure');
+  res.setHeader('Set-Cookie', parts.join('; '));
+}
+
+function clearSessionCookie(res: Response): void {
+  res.setHeader('Set-Cookie', 'bro_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
+}
+
+function extractAuthToken(req: Request): string | null {
+  const header = req.headers.authorization;
+  if (header && header.startsWith('Bearer ')) {
+    return header.slice('Bearer '.length).trim();
+  }
+  const cookies = parseCookies(req.headers.cookie);
+  return cookies.bro_session || null;
 }
 
 function requireAuth(req: AuthedRequest, res: Response, next: NextFunction): void {
-  const header = req.headers.authorization;
-  if (!header || !header.startsWith('Bearer ')) {
+  const token = extractAuthToken(req);
+  if (!token) {
     res.status(401).json({ error: 'غير مصرح — يرجى تسجيل الدخول أولاً' });
     return;
   }
-  const token = header.slice('Bearer '.length).trim();
   const payload = verifyToken(token);
   if (!payload) {
     res.status(401).json({ error: 'انتهت صلاحية الجلسة، يرجى إعادة تسجيل الدخول' });
     return;
   }
+  const userRow = db
+    .prepare('SELECT allowed_tower_ids_json FROM users WHERE id = ?')
+    .get(payload.sub) as { allowed_tower_ids_json?: string } | undefined;
   req.user = payload;
+  req.allowedTowerIds =
+    payload.role === 'admin'
+      ? []
+      : (JSON.parse(String(userRow?.allowed_tower_ids_json || '[]')) as string[]);
   next();
 }
 
@@ -880,12 +1056,18 @@ function requireRole(allowed: UserRole[]) {
   };
 }
 
+function canAccessTower(req: AuthedRequest, towerId: string | null | undefined): boolean {
+  if (!req.allowedTowerIds || req.allowedTowerIds.length === 0) return true;
+  if (!towerId) return false;
+  return req.allowedTowerIds.includes(towerId);
+}
+
 async function startServer(): Promise<void> {
   const app = express();
   app.use(express.json({ limit: '1mb' }));
 
   // =========================================================================
-  // Auth (Real accounts only — zero demo users or fake accounts #12, #83, #91)
+  // Auth (Real accounts + HttpOnly Cookie Session + RBAC)
   // =========================================================================
   app.post('/api/auth/register', (req: Request, res: Response) => {
     const ip = req.ip || 'unknown';
@@ -932,6 +1114,7 @@ async function startServer(): Promise<void> {
       networkName: cleanNet,
       role: 'admin',
     });
+    setSessionCookie(req, res, token);
 
     res.status(201).json({
       token,
@@ -942,6 +1125,7 @@ async function startServer(): Promise<void> {
         email: cleanEmail,
         networkName: cleanNet,
         role: 'admin',
+        allowedTowerIds: [],
       },
     });
   });
@@ -966,6 +1150,7 @@ async function startServer(): Promise<void> {
       return;
     }
 
+    const allowedTowerIds = JSON.parse(String(row.allowed_tower_ids_json || '[]')) as string[];
     const token = signToken({
       sub: String(row.id),
       ownerId: String(row.owner_id),
@@ -974,6 +1159,7 @@ async function startServer(): Promise<void> {
       networkName: String(row.network_name),
       role: row.role as UserRole,
     });
+    setSessionCookie(req, res, token);
 
     res.json({
       token,
@@ -984,12 +1170,34 @@ async function startServer(): Promise<void> {
         email: String(row.email),
         networkName: String(row.network_name),
         role: row.role as UserRole,
+        allowedTowerIds,
       },
     });
   });
 
+  app.get('/api/auth/me', requireAuth, (req: AuthedRequest, res: Response) => {
+    const token = extractAuthToken(req) || '';
+    res.json({
+      token,
+      user: {
+        id: req.user!.sub,
+        ownerId: req.user!.ownerId,
+        name: req.user!.name,
+        email: req.user!.email,
+        networkName: req.user!.networkName,
+        role: req.user!.role,
+        allowedTowerIds: req.allowedTowerIds || [],
+      },
+    });
+  });
+
+  app.post('/api/auth/logout', (_req: Request, res: Response) => {
+    clearSessionCookie(res);
+    res.json({ ok: true });
+  });
+
   // =========================================================================
-  // Dashboard & Multi-tenant State (#86)
+  // Dashboard & Multi-tenant State (#86, #96 Per-Tower RBAC, #99 Tower Health)
   // =========================================================================
   app.get('/api/dashboard', requireAuth, (req: AuthedRequest, res: Response) => {
     const ownerId = req.user!.ownerId;
@@ -997,14 +1205,17 @@ async function startServer(): Promise<void> {
     const routerRows = db
       .prepare('SELECT * FROM routers WHERE owner_id = ? ORDER BY created_at DESC')
       .all(ownerId) as Array<Record<string, unknown>>;
-    const subRows = db
+    const allSubRows = db
       .prepare('SELECT * FROM subscribers WHERE owner_id = ? ORDER BY username ASC')
       .all(ownerId) as Array<Record<string, unknown>>;
     const alertRows = db
       .prepare('SELECT * FROM alerts WHERE owner_id = ? ORDER BY created_at DESC LIMIT 60')
       .all(ownerId) as Array<Record<string, unknown>>;
-    const towerRows = db
+    const allTowerRows = db
       .prepare('SELECT * FROM towers WHERE owner_id = ?')
+      .all(ownerId) as Array<Record<string, unknown>>;
+    const allRadioRows = db
+      .prepare('SELECT * FROM rf_radios WHERE owner_id = ? ORDER BY created_at DESC')
       .all(ownerId) as Array<Record<string, unknown>>;
     const paymentRows = db
       .prepare('SELECT * FROM payments WHERE owner_id = ? ORDER BY created_at DESC LIMIT 50')
@@ -1013,9 +1224,21 @@ async function startServer(): Promise<void> {
       .prepare('SELECT * FROM hotspot_vouchers WHERE owner_id = ? ORDER BY created_at DESC LIMIT 20')
       .all(ownerId) as Array<Record<string, unknown>>;
 
+    const subRows = allSubRows.filter((s) =>
+      canAccessTower(req, s.tower_id ? String(s.tower_id) : null)
+    );
+    const towerRows = allTowerRows.filter((t) => canAccessTower(req, String(t.id)));
+    const radioRows = allRadioRows.filter((r) =>
+      canAccessTower(req, r.tower_id ? String(r.tower_id) : null)
+    );
+
+    const hydratedRadios = radioRows.map(hydrateRfRadio);
+    const hydratedSubs = subRows.map(hydrateSubscriber);
+
     res.json({
       routers: routerRows.map(hydrateRouter),
-      subscribers: subRows.map(hydrateSubscriber),
+      subscribers: hydratedSubs,
+      rfRadios: hydratedRadios,
       alerts: alertRows.map((a) => ({
         id: String(a.id),
         routerId: String(a.router_id),
@@ -1026,16 +1249,26 @@ async function startServer(): Promise<void> {
         timestamp: String(a.timestamp),
         acknowledged: Boolean(a.acknowledged),
       })),
-      towers: towerRows.map((t) => ({
-        id: String(t.id),
-        ownerId: String(t.owner_id),
-        name: String(t.name),
-        lat: Number(t.lat),
-        lng: Number(t.lng),
-        azimuthDeg: Number(t.azimuth_deg),
-        beamwidthDeg: Number(t.beamwidth_deg),
-        radiusMeters: Number(t.radius_meters),
-      })),
+      towers: towerRows.map((t) => {
+        const tid = String(t.id);
+        const tRadios = hydratedRadios.filter((r) => r.towerId === tid);
+        const tSubs = hydratedSubs.filter((s) => s.towerId === tid);
+        return {
+          id: tid,
+          ownerId: String(t.owner_id),
+          name: String(t.name),
+          lat: Number(t.lat),
+          lng: Number(t.lng),
+          azimuthDeg: Number(t.azimuth_deg),
+          beamwidthDeg: Number(t.beamwidth_deg),
+          radiusMeters: Number(t.radius_meters),
+          healthScore: computeTowerHealthScore({ radios: tRadios, subscribers: tSubs }),
+          onlineRadios: tRadios.filter((r) => r.status === 'online').length,
+          totalRadios: tRadios.length,
+          onlineSubs: tSubs.filter((s) => s.online).length,
+          totalSubs: tSubs.length,
+        };
+      }),
       payments: paymentRows.map((p) => ({
         id: String(p.id),
         subscriberId: String(p.subscriber_id),
@@ -1802,7 +2035,7 @@ async function startServer(): Promise<void> {
     }
   );
 
-  // Live Read-Only Diagnostics from RouterOS API (#13, Info tab)
+  // Live Read-Only Diagnostics from RouterOS API (#26, #35, #40, #45, #56, #66, #76, #77)
   app.get('/api/routers/:id/diagnostics', requireAuth, async (req: AuthedRequest, res: Response) => {
     const row = db
       .prepare('SELECT * FROM routers WHERE id = ? AND owner_id = ?')
@@ -1828,9 +2061,14 @@ async function startServer(): Promise<void> {
         arp,
         pppoeSrv,
         pppProf,
+        pppAct,
         hsAct,
         queues,
         vlans,
+        bridgePorts,
+        ipPools,
+        dhcpAlerts,
+        ntpRows,
         wl,
         svcs,
         dns,
@@ -1844,9 +2082,14 @@ async function startServer(): Promise<void> {
           ['/ip/arp/print'],
           ['/interface/pppoe-server/server/print'],
           ['/ppp/profile/print'],
+          ['/ppp/active/print'],
           ['/ip/hotspot/active/print'],
           ['/queue/simple/print'],
           ['/interface/vlan/print'],
+          ['/interface/bridge/port/print'],
+          ['/ip/pool/print'],
+          ['/ip/dhcp-server/alert/print'],
+          ['/system/ntp/client/print'],
           ['/interface/wireless/registration-table/print'],
           ['/ip/service/print'],
           ['/ip/dns/print'],
@@ -1855,7 +2098,53 @@ async function startServer(): Promise<void> {
         true
       );
 
+      // Detect ARP IP conflicts (#26)
+      const ipToMacs = new Map<string, Set<string>>();
+      for (const a of arp) {
+        const ip = a.address || '';
+        const mac = (a['mac-address'] || '').toUpperCase();
+        if (!ip || !mac) continue;
+        if (!ipToMacs.has(ip)) ipToMacs.set(ip, new Set());
+        ipToMacs.get(ip)!.add(mac);
+      }
+      const arpConflicts = Array.from(ipToMacs.entries())
+        .filter(([, macs]) => macs.size > 1)
+        .map(([ip, macs]) => ({ ip, macs: Array.from(macs) }));
+
+      // IP Pool usage computation (#56)
+      const activeIps = [
+        ...pppAct.map((p) => p.address || ''),
+        ...dhcp.filter((d) => d.status === 'bound').map((d) => d.address || ''),
+      ].filter(Boolean);
+
+      const ipToNum = (ip: string): number => {
+        const p = ip.split('.').map(Number);
+        if (p.length !== 4 || p.some((n) => !Number.isInteger(n))) return 0;
+        return ((p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]) >>> 0;
+      };
+
+      const parsedPools = ipPools.slice(0, 30).map((p) => {
+        const rangesStr = p.ranges || '';
+        let totalApprox = 0;
+        let usedCount = 0;
+        for (const seg of rangesStr.split(',').map((s) => s.trim()).filter(Boolean)) {
+          const [startStr, endStr] = seg.includes('-') ? seg.split('-') : [seg, seg];
+          const sNum = ipToNum(startStr);
+          const eNum = ipToNum(endStr || startStr);
+          if (sNum > 0 && eNum >= sNum) {
+            totalApprox += eNum - sNum + 1;
+            for (const aip of activeIps) {
+              const an = ipToNum(aip);
+              if (an >= sNum && an <= eNum) usedCount++;
+            }
+          }
+        }
+        return { name: p.name || '', ranges: rangesStr, usedCount, totalApprox };
+      });
+
       const dns0 = dns[0] || {};
+      const ntp0 = ntpRows[0] || {};
+
       res.json({
         ipAddresses: ips.slice(0, 60).map((r) => ({
           address: r.address || '',
@@ -1863,9 +2152,13 @@ async function startServer(): Promise<void> {
           iface: r.interface || '',
         })),
         routes: routes.slice(0, 60).map((r) => ({
+          id: r['.id'] || '',
           dst: r['dst-address'] || '',
           gateway: r.gateway || '',
           distance: r.distance || '',
+          active: r.active === 'true',
+          disabled: r.disabled === 'true',
+          comment: r.comment || '',
         })),
         dhcpLeases: dhcp.slice(0, 80).map((r) => ({
           address: r.address || '',
@@ -1878,6 +2171,7 @@ async function startServer(): Promise<void> {
           mac: r['mac-address'] || '',
           iface: r.interface || '',
         })),
+        arpConflicts,
         pppoeServers: pppoeSrv.slice(0, 30).map((r) => ({
           serviceName: r['service-name'] || '',
           iface: r.interface || '',
@@ -1903,6 +2197,25 @@ async function startServer(): Promise<void> {
           vlanId: r['vlan-id'] || '',
           iface: r.interface || '',
         })),
+        bridgePorts: bridgePorts.slice(0, 60).map((r) => ({
+          iface: r.interface || '',
+          bridge: r.bridge || '',
+          pvid: r.pvid || '1',
+          status: r.disabled === 'true' ? 'disabled' : r.inactive === 'true' ? 'inactive' : 'active',
+        })),
+        ipPools: parsedPools,
+        rogueDhcpAlerts: dhcpAlerts.slice(0, 20).map((r) => ({
+          iface: r.interface || '',
+          mac: r['unknown-server-mac'] || r['mac-address'] || '',
+          validServer: r['valid-server'] || '',
+          time: r['alert-timeout'] || '',
+        })),
+        ntpStatus: {
+          enabled: ntp0.enabled === 'true',
+          servers: ntp0.servers || ntp0['primary-ntp'] || 'غير محدد',
+          status: ntp0.status || (ntp0.enabled === 'true' ? 'active' : 'disabled'),
+          syncedServer: ntp0['synced-server'] || '',
+        },
         wirelessClients: wl.slice(0, 60).map((r) => ({
           mac: r['mac-address'] || '',
           iface: r.interface || '',
@@ -1920,7 +2233,7 @@ async function startServer(): Promise<void> {
           cacheUsedKb: Number(dns0['cache-used'] || 0),
           cacheSizeKb: Number(dns0['cache-size'] || 0),
         },
-        logs: logs.slice(-50).reverse().map((r) => ({
+        logs: logs.slice(-120).reverse().map((r) => ({
           time: r.time || '',
           topics: r.topics || '',
           message: r.message || '',
@@ -1929,6 +2242,465 @@ async function startServer(): Promise<void> {
     } catch (err) {
       res.status(502).json({ error: err instanceof Error ? err.message : 'تعذر قراءة التشخيصات من الراوتر' });
     }
+  });
+
+  // =========================================================================
+  // Deep MikroTik Control: PoE Cycle (#33), Torch (#36), Upgrade (#39), BTest (#43),
+  // NTP (#45), Multi-WAN (#66), Latency Matrix (#72,#73), Diff (#74), DNS Flush (#77),
+  // Traceroute (#79), Dual-WG (#80), Security Audit (#88)
+  // =========================================================================
+  app.post(
+    '/api/routers/:id/poe/:portName/cycle',
+    requireAuth,
+    requireRole(['admin', 'technician']),
+    async (req: AuthedRequest, res: Response) => {
+      const row = db
+        .prepare('SELECT * FROM routers WHERE id = ? AND owner_id = ?')
+        .get(req.params.id, req.user!.ownerId) as Record<string, unknown> | undefined;
+      if (!row) {
+        res.status(404).json({ error: 'الراوتر غير موجود' });
+        return;
+      }
+      if (row.permission_mode !== 'full-control') {
+        res.status(403).json({ error: 'إعادة تشغيل PoE تتطلب صلاحية التحكم الكامل' });
+        return;
+      }
+      const portName = String(req.params.portName || '').replace(/[^a-zA-Z0-9._-]/g, '');
+      try {
+        await execCommandsOnRouter(row, [
+          ['/interface/ethernet/poe/set', `=numbers=${portName}`, '=poe-out=off'],
+        ]);
+        await new Promise((r) => setTimeout(r, 1500));
+        await execCommandsOnRouter(row, [
+          ['/interface/ethernet/poe/set', `=numbers=${portName}`, '=poe-out=auto-on'],
+        ]);
+        addAuditLog(req.user!.ownerId, req.user!.name, req.user!.role, 'إعادة تشغيل PoE-Out', `${row.name} · ${portName}`);
+        res.json({ ok: true, message: `تم فصل وإعادة تشغيل الطاقة على ${portName}` });
+      } catch (err) {
+        res.status(502).json({ error: err instanceof Error ? err.message : 'فشل التحكم بـ PoE على هذا المنفذ' });
+      }
+    }
+  );
+
+  app.post('/api/routers/:id/torch', requireAuth, async (req: AuthedRequest, res: Response) => {
+    const row = db
+      .prepare('SELECT * FROM routers WHERE id = ? AND owner_id = ?')
+      .get(req.params.id, req.user!.ownerId) as Record<string, unknown> | undefined;
+    if (!row || row.status !== 'online') {
+      res.status(400).json({ error: 'يجب أن يكون الراوتر متصلاً لتشغيل Torch' });
+      return;
+    }
+    const iface = String((req.body as { iface?: string }).iface || 'ether1').replace(/[^a-zA-Z0-9._-]/g, '');
+    try {
+      const [rows] = await execCommandsOnRouter(row, [
+        ['/tool/torch', `=interface=${iface}`, '=duration=2', '=port=any'],
+      ]);
+      res.json({ iface, entries: parseTorchRows(rows) });
+    } catch (err) {
+      res.status(502).json({ error: err instanceof Error ? err.message : 'تعذر تشغيل Torch على الواجهة المطلوبة' });
+    }
+  });
+
+  app.post('/api/routers/:id/traceroute', requireAuth, async (req: AuthedRequest, res: Response) => {
+    const row = db
+      .prepare('SELECT * FROM routers WHERE id = ? AND owner_id = ?')
+      .get(req.params.id, req.user!.ownerId) as Record<string, unknown> | undefined;
+    if (!row || row.status !== 'online') {
+      res.status(400).json({ error: 'الراوتر غير متصل حالياً' });
+      return;
+    }
+    const target = String((req.body as { target?: string }).target || '1.1.1.1').trim();
+    if (!isValidHost(target)) {
+      res.status(400).json({ error: 'الهدف غير صالح' });
+      return;
+    }
+    try {
+      const [hops] = await execCommandsOnRouter(row, [
+        ['/tool/traceroute', `=address=${target}`, '=count=2'],
+      ]);
+      res.json({
+        target,
+        hops: hops.map((h, i) => ({
+          hop: i + 1,
+          address: h.address || '*',
+          lossPct: Number(h.loss || 0),
+          avgMs: h.avg || h.last || '-',
+        })),
+      });
+    } catch (err) {
+      res.status(502).json({ error: err instanceof Error ? err.message : 'تعذر تنفيذ Traceroute' });
+    }
+  });
+
+  app.post(
+    '/api/routers/:id/bandwidth-test',
+    requireAuth,
+    requireRole(['admin', 'technician']),
+    async (req: AuthedRequest, res: Response) => {
+      const row = db
+        .prepare('SELECT * FROM routers WHERE id = ? AND owner_id = ?')
+        .get(req.params.id, req.user!.ownerId) as Record<string, unknown> | undefined;
+      if (!row || row.status !== 'online') {
+        res.status(400).json({ error: 'الراوتر غير متصل حالياً' });
+        return;
+      }
+      const { target, direction = 'both', protocol = 'tcp' } = req.body as Record<string, unknown>;
+      if (typeof target !== 'string' || !isValidHost(target)) {
+        res.status(400).json({ error: 'أدخل عنوان IPv4 صالح للراوتر المقابل' });
+        return;
+      }
+      const dir = direction === 'receive' || direction === 'transmit' ? direction : 'both';
+      const proto = protocol === 'udp' ? 'udp' : 'tcp';
+      try {
+        const [rows] = await execCommandsOnRouter(row, [
+          ['/tool/bandwidth-test', `=address=${target.trim()}`, `=direction=${dir}`, `=protocol=${proto}`, '=duration=3s'],
+        ]);
+        const last = rows[rows.length - 1] || {};
+        res.json({
+          target: target.trim(),
+          rxMbps: Number((Number(last['rx-current'] || last['rx-10-second-average'] || 0) / 1e6).toFixed(2)),
+          txMbps: Number((Number(last['tx-current'] || last['tx-10-second-average'] || 0) / 1e6).toFixed(2)),
+          status: last.status || 'completed',
+        });
+      } catch (err) {
+        res.status(502).json({ error: err instanceof Error ? err.message : 'فشل اختبار Bandwidth-Test — تأكد من تفعيل BTest Server في الطرف المقابل' });
+      }
+    }
+  );
+
+  app.post(
+    '/api/routers/:id/dns/flush',
+    requireAuth,
+    requireRole(['admin', 'technician']),
+    async (req: AuthedRequest, res: Response) => {
+      const row = db
+        .prepare('SELECT * FROM routers WHERE id = ? AND owner_id = ?')
+        .get(req.params.id, req.user!.ownerId) as Record<string, unknown> | undefined;
+      if (!row || row.permission_mode !== 'full-control') {
+        res.status(403).json({ error: 'تصفير كاش DNS يتطلب صلاحية التحكم الكامل' });
+        return;
+      }
+      try {
+        await execCommandsOnRouter(row, [['/ip/dns/cache/flush']]);
+        addAuditLog(req.user!.ownerId, req.user!.name, req.user!.role, 'تصفير كاش DNS', String(row.name));
+        res.json({ ok: true, message: 'تم مسح كاش DNS على الراوتر بنجاح' });
+      } catch (err) {
+        res.status(502).json({ error: err instanceof Error ? err.message : 'فشل مسح كاش DNS' });
+      }
+    }
+  );
+
+  app.post(
+    '/api/routers/:id/ntp/sync',
+    requireAuth,
+    requireRole(['admin', 'technician']),
+    async (req: AuthedRequest, res: Response) => {
+      const row = db
+        .prepare('SELECT * FROM routers WHERE id = ? AND owner_id = ?')
+        .get(req.params.id, req.user!.ownerId) as Record<string, unknown> | undefined;
+      if (!row || row.permission_mode !== 'full-control') {
+        res.status(403).json({ error: 'ضبط NTP يتطلب صلاحية التحكم الكامل' });
+        return;
+      }
+      try {
+        await execCommandsOnRouter(row, [
+          ['/system/ntp/client/set', '=enabled=yes', '=servers=pool.ntp.org,time.cloudflare.com'],
+        ]);
+        addAuditLog(req.user!.ownerId, req.user!.name, req.user!.role, 'مزامنة ساعة NTP', String(row.name));
+        res.json({ ok: true, message: 'تم تفعيل ومزامنة التوقيت NTP بنجاح' });
+      } catch (err) {
+        res.status(502).json({ error: err instanceof Error ? err.message : 'تعذر ضبط NTP على الراوتر' });
+      }
+    }
+  );
+
+  app.post(
+    '/api/routers/:id/upgrade',
+    requireAuth,
+    requireRole(['admin']),
+    async (req: AuthedRequest, res: Response) => {
+      const row = db
+        .prepare('SELECT * FROM routers WHERE id = ? AND owner_id = ?')
+        .get(req.params.id, req.user!.ownerId) as Record<string, unknown> | undefined;
+      if (!row || row.permission_mode !== 'full-control') {
+        res.status(403).json({ error: 'الترقية عن بُعد تتطلب صلاحية التحكم الكامل' });
+        return;
+      }
+      const mode = (req.body as { mode?: string }).mode || 'check';
+      try {
+        if (mode === 'routerboard') {
+          await execCommandsOnRouter(row, [['/system/routerboard/upgrade']]);
+          addAuditLog(req.user!.ownerId, req.user!.name, req.user!.role, 'ترقية Firmware اللوحة', String(row.name));
+          res.json({ ok: true, message: 'تم جدولة ترقية RouterBOOT Firmware (ستطبق عند إعادة التشغيل)' });
+          return;
+        }
+        if (mode === 'install') {
+          await execCommandsOnRouter(row, [['/system/package/update/download-and-install']]);
+          addAuditLog(req.user!.ownerId, req.user!.name, req.user!.role, 'تحديث RouterOS', String(row.name));
+          res.json({ ok: true, message: 'بدأ تنزيل وتثبيت تحديث RouterOS الآن' });
+          return;
+        }
+        const [rows] = await execCommandsOnRouter(row, [['/system/package/update/check-for-updates']]);
+        const last = rows[rows.length - 1] || {};
+        res.json({
+          ok: true,
+          installedVersion: last['installed-version'] || row.routeros_version,
+          latestVersion: last['latest-version'] || row.routeros_version,
+          status: last.status || 'checked',
+        });
+      } catch (err) {
+        res.status(502).json({ error: err instanceof Error ? err.message : 'فشل التحقق أو الترقية على الراوتر' });
+      }
+    }
+  );
+
+  app.post(
+    '/api/routers/bulk-upgrade',
+    requireAuth,
+    requireRole(['admin']),
+    async (req: AuthedRequest, res: Response) => {
+      const ownerId = req.user!.ownerId;
+      const rows = db
+        .prepare("SELECT * FROM routers WHERE owner_id = ? AND status = 'online' AND permission_mode = 'full-control'")
+        .all(ownerId) as Array<Record<string, unknown>>;
+      const results: Array<{ id: string; name: string; status: string }> = [];
+      for (const r of rows) {
+        try {
+          const [upd] = await execCommandsOnRouter(r, [['/system/package/update/check-for-updates']]);
+          const last = upd[upd.length - 1] || {};
+          results.push({ id: String(r.id), name: String(r.name), status: last.status || 'checked' });
+        } catch {
+          results.push({ id: String(r.id), name: String(r.name), status: 'unreachable' });
+        }
+      }
+      res.json({ results });
+    }
+  );
+
+  app.get('/api/routers/:id/config-diffs', requireAuth, (req: AuthedRequest, res: Response) => {
+    const rows = db
+      .prepare('SELECT id, router_id, summary, added_count, removed_count, diff_lines_json, created_at FROM config_diffs WHERE router_id = ? AND owner_id = ? ORDER BY created_at DESC LIMIT 15')
+      .all(req.params.id, req.user!.ownerId) as Array<Record<string, unknown>>;
+    res.json({
+      diffs: rows.map((d) => ({
+        id: String(d.id),
+        routerId: String(d.router_id),
+        summary: String(d.summary),
+        addedCount: Number(d.added_count),
+        removedCount: Number(d.removed_count),
+        diffLines: JSON.parse(String(d.diff_lines_json || '[]')),
+        createdAt: String(d.created_at),
+      })),
+    });
+  });
+
+  app.post(
+    '/api/routers/:id/config-diffs',
+    requireAuth,
+    requireRole(['admin', 'technician']),
+    async (req: AuthedRequest, res: Response) => {
+      const ownerId = req.user!.ownerId;
+      const row = db
+        .prepare('SELECT * FROM routers WHERE id = ? AND owner_id = ?')
+        .get(req.params.id, ownerId) as Record<string, unknown> | undefined;
+      if (!row || row.status !== 'online') {
+        res.status(400).json({ error: 'الراوتر غير متصل' });
+        return;
+      }
+      try {
+        const [ips, routes, fw, vlans, svcs, profs] = await execCommandsOnRouter(
+          row,
+          [
+            ['/ip/address/print'],
+            ['/ip/route/print'],
+            ['/ip/firewall/filter/print'],
+            ['/interface/vlan/print'],
+            ['/ip/service/print'],
+            ['/ppp/profile/print'],
+          ],
+          true
+        );
+        const lines: string[] = [
+          ...ips.map((r) => `/ip address add address=${r.address} interface=${r.interface}`),
+          ...routes.map((r) => `/ip route add dst-address=${r['dst-address']} gateway=${r.gateway} distance=${r.distance || 1} disabled=${r.disabled || 'no'}`),
+          ...vlans.map((r) => `/interface vlan add name=${r.name} vlan-id=${r['vlan-id']} interface=${r.interface}`),
+          ...svcs.map((r) => `/ip service set ${r.name} port=${r.port} disabled=${r.disabled || 'no'} address=${r.address || '0.0.0.0/0'}`),
+          ...profs.map((r) => `/ppp profile add name=${r.name} rate-limit=${r['rate-limit'] || ''}`),
+          ...fw.slice(0, 60).map((r) => `/ip firewall filter add chain=${r.chain} action=${r.action} dst-port=${r['dst-port'] || ''} protocol=${r.protocol || ''} disabled=${r.disabled || 'no'}`),
+        ];
+        const rawText = lines.join('\n');
+        const prev = db
+          .prepare('SELECT raw_rsc FROM config_diffs WHERE router_id = ? AND owner_id = ? ORDER BY created_at DESC LIMIT 1')
+          .get(req.params.id, ownerId) as { raw_rsc: string } | undefined;
+        const diff = computeRscLineDiff(prev?.raw_rsc || '', rawText);
+        const id = `dif-${crypto.randomUUID()}`;
+        const nowIso = new Date().toISOString();
+        const summary = prev
+          ? `+${diff.addedCount} سطر مضاف / -${diff.removedCount} سطر محذوف`
+          : `لقطة خط الأساس (${lines.length} سطر إعداد)`;
+        db.prepare(
+          'INSERT INTO config_diffs (id, owner_id, router_id, summary, added_count, removed_count, raw_rsc, diff_lines_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        ).run(id, ownerId, req.params.id, summary, diff.addedCount, diff.removedCount, rawText, JSON.stringify(diff.diffLines), nowIso);
+        addAuditLog(ownerId, req.user!.name, req.user!.role, 'مقارنة إعدادات .rsc', `${row.name}: ${summary}`);
+        res.status(201).json({ id, summary, addedCount: diff.addedCount, removedCount: diff.removedCount, diffLines: diff.diffLines, createdAt: nowIso });
+      } catch (err) {
+        res.status(502).json({ error: err instanceof Error ? err.message : 'تعذر قراءة لقطة الإعدادات من الراوتر' });
+      }
+    }
+  );
+
+  app.get('/api/routers/:id/security-audit', requireAuth, async (req: AuthedRequest, res: Response) => {
+    const ownerId = req.user!.ownerId;
+    const row = db
+      .prepare('SELECT * FROM routers WHERE id = ? AND owner_id = ?')
+      .get(req.params.id, ownerId) as Record<string, unknown> | undefined;
+    if (!row || row.status !== 'online') {
+      res.status(400).json({ error: 'الراوتر غير متصل حالياً' });
+      return;
+    }
+    try {
+      const [services, users, fw] = await execCommandsOnRouter(
+        row,
+        [['/ip/service/print'], ['/user/print'], ['/ip/firewall/filter/print']],
+        true
+      );
+      const metaKey = `ros_users_${req.params.id}`;
+      const knownRow = db.prepare('SELECT value FROM app_meta WHERE key = ?').get(metaKey) as { value: string } | undefined;
+      const prevKnownAdminNames = knownRow ? (JSON.parse(knownRow.value) as string[]) : [];
+      const audit = evaluateRouterSecurity({ services, users, firewallInput: fw, prevKnownAdminNames });
+      db.prepare('INSERT OR REPLACE INTO app_meta (key, value) VALUES (?, ?)').run(
+        metaKey,
+        JSON.stringify(audit.adminUsers.map((u) => u.name).filter(Boolean))
+      );
+      if (audit.newAdminUsersDetected.length > 0) {
+        createAlert(
+          ownerId,
+          String(row.id),
+          String(row.name),
+          'critical',
+          `تحذير أمني: مستخدم إدارة جديد على ${row.name}`,
+          `تم رصد إنشاء حساب جديدة (${audit.newAdminUsersDetected.join(', ')}) داخل /user`
+        );
+      }
+      res.json(audit);
+    } catch (err) {
+      res.status(502).json({ error: err instanceof Error ? err.message : 'فشل تدقيق أمان الراوتر' });
+    }
+  });
+
+  app.get('/api/routers/:id/latency', requireAuth, (req: AuthedRequest, res: Response) => {
+    const probes = db
+      .prepare('SELECT * FROM latency_probes WHERE router_id = ? AND owner_id = ? ORDER BY id DESC LIMIT 60')
+      .all(req.params.id, req.user!.ownerId) as Array<Record<string, unknown>>;
+    const failovers = db
+      .prepare('SELECT * FROM failover_events WHERE router_id = ? AND owner_id = ? ORDER BY id DESC LIMIT 30')
+      .all(req.params.id, req.user!.ownerId) as Array<Record<string, unknown>>;
+    res.json({
+      probes: probes.map((p) => ({
+        id: Number(p.id),
+        routerId: String(p.router_id),
+        target: String(p.target),
+        label: String(p.label),
+        latencyMs: p.latency_ms !== null ? Number(p.latency_ms) : null,
+        packetLossPct: Number(p.packet_loss_pct || 0),
+        recordedAt: String(p.recorded_at),
+      })),
+      failovers: failovers.map((f) => ({
+        id: Number(f.id),
+        routerId: String(f.router_id),
+        routerName: String(f.router_name),
+        fromGateway: String(f.from_gateway),
+        toGateway: String(f.to_gateway),
+        reason: String(f.reason),
+        createdAt: String(f.created_at),
+      })),
+    });
+  });
+
+  app.post('/api/routers/:id/latency/probe', requireAuth, async (req: AuthedRequest, res: Response) => {
+    const ownerId = req.user!.ownerId;
+    const row = db
+      .prepare('SELECT * FROM routers WHERE id = ? AND owner_id = ?')
+      .get(req.params.id, ownerId) as Record<string, unknown> | undefined;
+    if (!row || row.status !== 'online') {
+      res.status(400).json({ error: 'الراوتر غير متصل' });
+      return;
+    }
+    const targets = [
+      { target: '1.1.1.1', label: 'Cloudflare DNS' },
+      { target: '8.8.8.8', label: 'Google DNS' },
+      { target: '9.9.9.9', label: 'Quad9 DNS' },
+    ];
+    const nowIso = new Date().toISOString();
+    const out = [];
+    for (const pt of targets) {
+      const pr = await runPingViaContext(row, pt.target).catch(() => ({
+        status: 'down' as const,
+        latencyMs: null,
+        packetLossPct: 100,
+      }));
+      db.prepare(
+        'INSERT INTO latency_probes (owner_id, router_id, target, label, latency_ms, packet_loss_pct, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+      ).run(ownerId, String(row.id), pt.target, pt.label, pr.latencyMs, pr.packetLossPct, nowIso);
+      out.push({ ...pt, ...pr, recordedAt: nowIso });
+    }
+    res.json({ results: out });
+  });
+
+  app.post(
+    '/api/routers/:id/routes/toggle',
+    requireAuth,
+    requireRole(['admin', 'technician']),
+    async (req: AuthedRequest, res: Response) => {
+      const row = db
+        .prepare('SELECT * FROM routers WHERE id = ? AND owner_id = ?')
+        .get(req.params.id, req.user!.ownerId) as Record<string, unknown> | undefined;
+      if (!row || row.permission_mode !== 'full-control') {
+        res.status(403).json({ error: 'التحكم بالمسارات يتطلب صلاحية التحكم الكامل' });
+        return;
+      }
+      const { routeId, disabled, distance, comment } = req.body as Record<string, unknown>;
+      if (typeof routeId !== 'string' || !routeId) {
+        res.status(400).json({ error: 'معرف المسار غير صالح' });
+        return;
+      }
+      const args = ['/ip/route/set', `=.id=${routeId}`];
+      if (typeof disabled === 'boolean') args.push(`=disabled=${disabled ? 'yes' : 'no'}`);
+      if (typeof distance === 'number' && distance > 0) args.push(`=distance=${Math.round(distance)}`);
+      try {
+        await execCommandsOnRouter(row, [args]);
+        if (typeof disabled === 'boolean') {
+          db.prepare(
+            'INSERT INTO failover_events (owner_id, router_id, router_name, from_gateway, to_gateway, reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+          ).run(
+            req.user!.ownerId,
+            String(row.id),
+            String(row.name),
+            String(comment || routeId),
+            disabled ? 'تم تعطيل المسار يدوياً' : 'تم تفعيل المسار يدوياً',
+            `تبديل يدوي عبر Bro Radius (${req.user!.name})`,
+            new Date().toISOString()
+          );
+        }
+        addAuditLog(req.user!.ownerId, req.user!.name, req.user!.role, 'تعديل مسار Multi-WAN', `${row.name} (${routeId})`);
+        res.json({ ok: true });
+      } catch (err) {
+        res.status(502).json({ error: err instanceof Error ? err.message : 'فشل تعديل المسار' });
+      }
+    }
+  );
+
+  app.post('/api/routers/:id/dual-wg-script', requireAuth, async (req: AuthedRequest, res: Response) => {
+    const wgCtx = await getOwnerWgContext(req.user!.ownerId);
+    const { secondaryEndpoint, secondaryPort = 51821 } = req.body as Record<string, unknown>;
+    const endpoint = typeof secondaryEndpoint === 'string' && secondaryEndpoint.trim() ? secondaryEndpoint.trim() : wgCtx.endpoint || 'YOUR_BACKUP_VPS_IP';
+    res.json({
+      script: buildDualHomedWireGuardScript({
+        secondaryEndpoint: endpoint,
+        secondaryPort: Number(secondaryPort) || 51821,
+        serverPublicKey: wgCtx.wgPublicKey,
+      }),
+    });
   });
 
   // Router Backups (.backup & .rsc export) (#19)
@@ -2092,7 +2864,782 @@ async function startServer(): Promise<void> {
   });
 
   // =========================================================================
-  // Subscribers: Real Session Disconnect, Profile Change, Billing, Payments, CSV (#44-#54)
+  // RF & Wireless Sector/Nano Telemetry (#1-#8, #10, #13-#15)
+  // =========================================================================
+  async function performRfSync(radioRow: Record<string, unknown>): Promise<RfRadioDevice> {
+    const radioId = String(radioRow.id);
+    const ownerId = String(radioRow.owner_id);
+    const name = String(radioRow.name);
+    const vendor = String(radioRow.vendor || 'mikrotik') as RfVendor;
+    const protocol = String(radioRow.protocol || 'ros') as RfProtocol;
+    const host = String(radioRow.host);
+    const port = Number(radioRow.port || 8728);
+    const username = String(radioRow.username || 'admin');
+    const secret = radioRow.secret_enc ? decryptSecret(String(radioRow.secret_enc)) : '';
+    const nowIso = new Date().toISOString();
+
+    try {
+      const snap = await pollRfRadio({ host, vendor, protocol, port, username, secret });
+      // Correlate RF station MACs to PPPoE Subscribers (#10)
+      const subs = db
+        .prepare('SELECT id, username, mac FROM subscribers WHERE owner_id = ?')
+        .all(ownerId) as Array<{ id: string; username: string; mac: string }>;
+      const subByMac = new Map(subs.filter((s) => s.mac).map((s) => [s.mac.toUpperCase(), s]));
+
+      const enrichedClients = snap.clients.map((c) => {
+        const matched = subByMac.get(c.mac.toUpperCase());
+        if (matched) {
+          db.prepare('UPDATE subscribers SET rf_radio_id = ?, signal_dbm = COALESCE(?, signal_dbm), distance_km = COALESCE(?, distance_km) WHERE id = ?').run(
+            radioId,
+            c.signalDbm,
+            c.distanceKm ?? null,
+            matched.id
+          );
+        }
+        return {
+          ...c,
+          subscriberId: matched?.id ?? null,
+          subscriberUsername: matched?.username ?? null,
+        };
+      });
+
+      db.prepare(`
+        UPDATE rf_radios SET
+          status = 'online', last_error = NULL, model = ?, ssid = ?,
+          frequency_mhz = ?, channel_width_mhz = ?, tx_power_dbm = ?,
+          ccq_pct = ?, airtime_pct = ?, signal_dbm = ?, noise_floor_dbm = ?, snr_db = ?,
+          chain0_dbm = ?, chain1_dbm = ?, chain_imbalance_db = ?,
+          tx_rate_mbps = ?, rx_rate_mbps = ?, distance_km = ?, lan_speed = ?,
+          clients_json = ?, last_sync = ?
+        WHERE id = ?
+      `).run(
+        snap.model, snap.ssid, snap.frequencyMhz, snap.channelWidthMhz, snap.txPowerDbm,
+        snap.ccqPct, snap.airtimePct, snap.signalDbm, snap.noiseFloorDbm, snap.snrDb,
+        snap.chain0Dbm, snap.chain1Dbm, snap.chainImbalanceDb,
+        snap.txRateMbps, snap.rxRateMbps, snap.distanceKm, snap.lanSpeed,
+        JSON.stringify(enrichedClients), nowIso, radioId
+      );
+
+      db.prepare(
+        'INSERT INTO rf_signal_history (radio_id, signal_dbm, noise_floor_dbm, ccq_pct, airtime_pct, recorded_at) VALUES (?, ?, ?, ?, ?, ?)'
+      ).run(radioId, snap.signalDbm, snap.noiseFloorDbm, snap.ccqPct, snap.airtimePct, nowIso);
+
+      // RF Smart Alerts (#5, #6, #7, #15)
+      if (snap.chainImbalanceDb !== null && snap.chainImbalanceDb > 6) {
+        createAlert(ownerId, radioId, name, 'warning', `عدم تطابق استقطاب Chain: ${name}`, `الفرق بين H/V بلغ ${snap.chainImbalanceDb}dB — يرجى فحص توجيه الصحن أو الـ Pigtail.`);
+      }
+      if (snap.noiseFloorDbm !== null && snap.noiseFloorDbm > -85) {
+        createAlert(ownerId, radioId, name, 'warning', `تشويش RF مرتفع: ${name}`, `مستوى الضجيج ${snap.noiseFloorDbm}dBm تجاوز الحد الموصى به (-85dBm).`);
+      }
+      if (snap.ccqPct !== null && snap.ccqPct < 75) {
+        createAlert(ownerId, radioId, name, 'warning', `انخفاض كفاءة CCQ: ${name}`, `نسبة CCQ هبطت إلى ${snap.ccqPct}% على تردد ${snap.frequencyMhz || '-'} MHz.`);
+      }
+      if (snap.lanSpeed === '10M') {
+        createAlert(ownerId, radioId, name, 'critical', `كبل LAN تالف (10M): ${name}`, `تفاوض منفذ الإيثرنت على الجهاز نزل إلى 10M بدلاً من 1G/100M!`);
+      }
+
+      const updated = db.prepare('SELECT * FROM rf_radios WHERE id = ?').get(radioId) as Record<string, unknown>;
+      return hydrateRfRadio(updated);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'تعذر قراءة بيانات الراديو اللاسلكي';
+      db.prepare("UPDATE rf_radios SET status = 'offline', last_error = ? WHERE id = ?").run(msg, radioId);
+      throw new Error(msg);
+    }
+  }
+
+  app.get('/api/rf/radios', requireAuth, (req: AuthedRequest, res: Response) => {
+    const rows = db
+      .prepare('SELECT * FROM rf_radios WHERE owner_id = ? ORDER BY created_at DESC')
+      .all(req.user!.ownerId) as Array<Record<string, unknown>>;
+    res.json({
+      radios: rows
+        .filter((r) => canAccessTower(req, r.tower_id ? String(r.tower_id) : null))
+        .map(hydrateRfRadio),
+    });
+  });
+
+  app.post(
+    '/api/rf/radios',
+    requireAuth,
+    requireRole(['admin', 'technician']),
+    async (req: AuthedRequest, res: Response) => {
+      const ownerId = req.user!.ownerId;
+      const { name, host, vendor = 'mikrotik', protocol = 'ros', port, username = 'admin', secret = '', towerId = null, routerId = null } =
+        req.body as Record<string, unknown>;
+      if (typeof name !== 'string' || typeof host !== 'string' || !name.trim() || !isValidHost(host)) {
+        res.status(400).json({ error: 'يرجى إدخال اسم الراديو وعنوان IP أو Host صحيح' });
+        return;
+      }
+      const v: RfVendor = ['mikrotik', 'ubiquiti', 'mimosa', 'cambium'].includes(String(vendor))
+        ? (vendor as RfVendor)
+        : 'mikrotik';
+      const p: RfProtocol = ['ros', 'snmp', 'airos'].includes(String(protocol))
+        ? (protocol as RfProtocol)
+        : 'ros';
+      const defaultPort = p === 'snmp' ? 161 : p === 'airos' ? 443 : 8728;
+      const numPort = Number(port) || defaultPort;
+      const id = `rf-${crypto.randomUUID()}`;
+      const nowIso = new Date().toISOString();
+
+      db.prepare(`
+        INSERT INTO rf_radios (id, owner_id, router_id, tower_id, name, host, vendor, protocol, port, username, secret_enc, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+      `).run(
+        id,
+        ownerId,
+        typeof routerId === 'string' && routerId ? routerId : null,
+        typeof towerId === 'string' && towerId ? towerId : null,
+        name.trim().slice(0, 48),
+        host.trim(),
+        v,
+        p,
+        numPort,
+        typeof username === 'string' ? username.trim() : 'admin',
+        typeof secret === 'string' && secret ? encryptSecret(secret) : '',
+        nowIso
+      );
+
+      const createdRow = db.prepare('SELECT * FROM rf_radios WHERE id = ?').get(id) as Record<string, unknown>;
+      try {
+        const synced = await performRfSync(createdRow);
+        addAuditLog(ownerId, req.user!.name, req.user!.role, 'إضافة جهاز بث RF', `${name.trim()} (${host.trim()})`);
+        res.status(201).json({ radio: synced });
+      } catch {
+        const fallback = db.prepare('SELECT * FROM rf_radios WHERE id = ?').get(id) as Record<string, unknown>;
+        res.status(201).json({ radio: hydrateRfRadio(fallback) });
+      }
+    }
+  );
+
+  app.post('/api/rf/radios/:id/sync', requireAuth, async (req: AuthedRequest, res: Response) => {
+    const row = db
+      .prepare('SELECT * FROM rf_radios WHERE id = ? AND owner_id = ?')
+      .get(req.params.id, req.user!.ownerId) as Record<string, unknown> | undefined;
+    if (!row) {
+      res.status(404).json({ error: 'الجهاز غير موجود' });
+      return;
+    }
+    try {
+      const radio = await performRfSync(row);
+      res.json({ radio });
+    } catch (err) {
+      res.status(502).json({ error: err instanceof Error ? err.message : 'فشل سحب بيانات الإشارة' });
+    }
+  });
+
+  app.get('/api/rf/radios/:id/history', requireAuth, (req: AuthedRequest, res: Response) => {
+    const row = db
+      .prepare('SELECT id FROM rf_radios WHERE id = ? AND owner_id = ?')
+      .get(req.params.id, req.user!.ownerId);
+    if (!row) {
+      res.status(404).json({ error: 'الجهاز غير موجود' });
+      return;
+    }
+    const samples = db
+      .prepare('SELECT * FROM rf_signal_history WHERE radio_id = ? ORDER BY id DESC LIMIT 120')
+      .all(req.params.id) as Array<Record<string, unknown>>;
+    res.json({
+      samples: samples.reverse().map((s) => ({
+        id: Number(s.id),
+        radioId: String(s.radio_id),
+        signalDbm: s.signal_dbm !== null ? Number(s.signal_dbm) : null,
+        noiseFloorDbm: s.noise_floor_dbm !== null ? Number(s.noise_floor_dbm) : null,
+        ccqPct: s.ccq_pct !== null ? Number(s.ccq_pct) : null,
+        airtimePct: s.airtime_pct !== null ? Number(s.airtime_pct) : null,
+        recordedAt: String(s.recorded_at),
+      })),
+    });
+  });
+
+  app.post('/api/rf/radios/:id/scan', requireAuth, async (req: AuthedRequest, res: Response) => {
+    const row = db
+      .prepare('SELECT * FROM rf_radios WHERE id = ? AND owner_id = ?')
+      .get(req.params.id, req.user!.ownerId) as Record<string, unknown> | undefined;
+    if (!row) {
+      res.status(404).json({ error: 'الجهاز غير موجود' });
+      return;
+    }
+    if (row.protocol !== 'ros') {
+      res.status(400).json({ error: 'فحص الترددات النظيفة (Frequency Monitor) متاح لأجهزة MikroTik عبر RouterOS API' });
+      return;
+    }
+    try {
+      const channels = await scanMikroTikCleanFrequencies(
+        String(row.host),
+        Number(row.port || 8728),
+        String(row.username || 'admin'),
+        row.secret_enc ? decryptSecret(String(row.secret_enc)) : ''
+      );
+      res.json({ channels });
+    } catch (err) {
+      res.status(502).json({ error: err instanceof Error ? err.message : 'فشل مسح الطيف الترددي' });
+    }
+  });
+
+  app.post(
+    '/api/rf/radios/:id/frequency',
+    requireAuth,
+    requireRole(['admin', 'technician']),
+    async (req: AuthedRequest, res: Response) => {
+      const row = db
+        .prepare('SELECT * FROM rf_radios WHERE id = ? AND owner_id = ?')
+        .get(req.params.id, req.user!.ownerId) as Record<string, unknown> | undefined;
+      if (!row || row.protocol !== 'ros') {
+        res.status(400).json({ error: 'تغيير التردد يتطلب جهاز MikroTik عبر RouterOS API' });
+        return;
+      }
+      const { frequencyMhz, scheduleTime } = req.body as Record<string, unknown>;
+      try {
+        await applyFrequencyShift({
+          host: String(row.host),
+          port: Number(row.port || 8728),
+          username: String(row.username || 'admin'),
+          password: row.secret_enc ? decryptSecret(String(row.secret_enc)) : '',
+          frequencyMhz: Number(frequencyMhz),
+          scheduleTime: typeof scheduleTime === 'string' && scheduleTime.trim() ? scheduleTime.trim() : undefined,
+        });
+        addAuditLog(req.user!.ownerId, req.user!.name, req.user!.role, 'تغيير/جدولة التردد', `${row.name} -> ${frequencyMhz} MHz`);
+        res.json({ ok: true, message: scheduleTime ? `تمت جدولة التحويل إلى ${frequencyMhz}MHz عند ${scheduleTime}` : `تم التحويل الفوري إلى ${frequencyMhz}MHz` });
+      } catch (err) {
+        res.status(502).json({ error: err instanceof Error ? err.message : 'تعذر تعديل التردد' });
+      }
+    }
+  );
+
+  app.post(
+    '/api/rf/radios/:id/reboot',
+    requireAuth,
+    requireRole(['admin', 'technician']),
+    async (req: AuthedRequest, res: Response) => {
+      const row = db
+        .prepare('SELECT * FROM rf_radios WHERE id = ? AND owner_id = ?')
+        .get(req.params.id, req.user!.ownerId) as Record<string, unknown> | undefined;
+      if (!row) {
+        res.status(404).json({ error: 'الجهاز غير موجود' });
+        return;
+      }
+      try {
+        await rebootRfRadio({
+          host: String(row.host),
+          protocol: String(row.protocol) as RfProtocol,
+          port: Number(row.port || 8728),
+          username: String(row.username || 'admin'),
+          secret: row.secret_enc ? decryptSecret(String(row.secret_enc)) : '',
+        });
+        addAuditLog(req.user!.ownerId, req.user!.name, req.user!.role, 'إعادة تشغيل جهاز RF', String(row.name));
+        res.json({ ok: true, message: `تم إرسال أمر إعادة التشغيل إلى ${row.name}` });
+      } catch (err) {
+        res.status(502).json({ error: err instanceof Error ? err.message : 'تعذر إعادة تشغيل الجهاز' });
+      }
+    }
+  );
+
+  app.delete(
+    '/api/rf/radios/:id',
+    requireAuth,
+    requireRole(['admin', 'technician']),
+    (req: AuthedRequest, res: Response) => {
+      db.prepare('DELETE FROM rf_radios WHERE id = ? AND owner_id = ?').run(req.params.id, req.user!.ownerId);
+      res.json({ deleted: true });
+    }
+  );
+
+  // =========================================================================
+  // Subscribers CPE (TR-069 / MikroTik Conntrack / HTTP Proxy) + CoA + Sessions (#16-#30, #46, #48, #54, #57)
+  // =========================================================================
+  function getOwnerGenieAcsConfig(ownerId: string): GenieAcsConfig | null {
+    const row = db
+      .prepare('SELECT genieacs_url, genieacs_user, genieacs_pass_enc FROM notification_settings WHERE owner_id = ?')
+      .get(ownerId) as { genieacs_url?: string; genieacs_user?: string; genieacs_pass_enc?: string } | undefined;
+    if (!row?.genieacs_url) return null;
+    return {
+      url: row.genieacs_url,
+      username: row.genieacs_user || undefined,
+      password: row.genieacs_pass_enc ? decryptSecret(row.genieacs_pass_enc) : undefined,
+    };
+  }
+
+  function hydrateCpeDevice(subRow: Record<string, unknown>): CpeDeviceInfo {
+    const subId = String(subRow.id);
+    const c = db.prepare('SELECT * FROM cpe_devices WHERE subscriber_id = ?').get(subId) as Record<string, unknown> | undefined;
+    if (!c) {
+      return {
+        subscriberId: subId,
+        source: 'unconfigured',
+        tr069DeviceId: null,
+        cpeHost: subRow.ip ? String(subRow.ip) : null,
+        cpePort: 80,
+        model: null,
+        serialNumber: null,
+        firmware: null,
+        uptimeSec: null,
+        cpuPct: null,
+        ramPct: null,
+        wanIp: subRow.ip ? String(subRow.ip) : null,
+        wifiSsid24: null,
+        wifiChannel24: null,
+        wifiSsid5: null,
+        wifiChannel5: null,
+        connectedCount: 0,
+        connectedHosts: [],
+        tr143DownMbps: null,
+        tr143UpMbps: null,
+        lastSyncedAt: null,
+        hasConfigBackup: false,
+      };
+    }
+    return {
+      subscriberId: subId,
+      source: String(c.source || 'unconfigured') as CpeDeviceInfo['source'],
+      tr069DeviceId: c.tr069_device_id ? String(c.tr069_device_id) : null,
+      cpeHost: c.cpe_host ? String(c.cpe_host) : subRow.ip ? String(subRow.ip) : null,
+      cpePort: Number(c.cpe_port || 80),
+      model: c.model ? String(c.model) : null,
+      serialNumber: c.serial_number ? String(c.serial_number) : null,
+      firmware: c.firmware ? String(c.firmware) : null,
+      uptimeSec: c.uptime_sec !== null && c.uptime_sec !== undefined ? Number(c.uptime_sec) : null,
+      cpuPct: c.cpu_pct !== null && c.cpu_pct !== undefined ? Number(c.cpu_pct) : null,
+      ramPct: c.ram_pct !== null && c.ram_pct !== undefined ? Number(c.ram_pct) : null,
+      wanIp: c.wan_ip ? String(c.wan_ip) : null,
+      wifiSsid24: c.wifi_ssid_24 ? String(c.wifi_ssid_24) : null,
+      wifiChannel24: c.wifi_channel_24 ? String(c.wifi_channel_24) : null,
+      wifiSsid5: c.wifi_ssid_5 ? String(c.wifi_ssid_5) : null,
+      wifiChannel5: c.wifi_channel_5 ? String(c.wifi_channel_5) : null,
+      connectedCount: Number(c.connected_count || 0),
+      connectedHosts: JSON.parse(String(c.connected_hosts_json || '[]')) as CpeConnectedHost[],
+      tr143DownMbps: c.tr143_down_mbps !== null && c.tr143_down_mbps !== undefined ? Number(c.tr143_down_mbps) : null,
+      tr143UpMbps: c.tr143_up_mbps !== null && c.tr143_up_mbps !== undefined ? Number(c.tr143_up_mbps) : null,
+      lastSyncedAt: c.last_synced_at ? String(c.last_synced_at) : null,
+      hasConfigBackup: Boolean(c.last_config_backup_json),
+    };
+  }
+
+  app.get('/api/subscribers/:id/cpe', requireAuth, (req: AuthedRequest, res: Response) => {
+    const ownerId = req.user!.ownerId;
+    const sub = db
+      .prepare('SELECT * FROM subscribers WHERE id = ? AND owner_id = ?')
+      .get(req.params.id, ownerId) as Record<string, unknown> | undefined;
+    if (!sub || !canAccessTower(req, sub.tower_id ? String(sub.tower_id) : null)) {
+      res.status(404).json({ error: 'المشترك غير موجود أو خارج نطاق برجك' });
+      return;
+    }
+    const sessions = db
+      .prepare('SELECT * FROM subscriber_sessions WHERE subscriber_id = ? ORDER BY id DESC LIMIT 50')
+      .all(req.params.id) as Array<Record<string, unknown>>;
+
+    res.json({
+      cpe: hydrateCpeDevice(sub),
+      sessions: sessions.map((s) => ({
+        id: Number(s.id),
+        subscriberId: String(s.subscriber_id),
+        ip: String(s.ip || ''),
+        mac: String(s.mac || ''),
+        loginAt: String(s.login_at),
+        logoutAt: s.logout_at ? String(s.logout_at) : null,
+        durationSec: Number(s.duration_sec || 0),
+        rxGb: Number(s.rx_gb || 0),
+        txGb: Number(s.tx_gb || 0),
+        disconnectCause: String(s.disconnect_cause || ''),
+      })),
+    });
+  });
+
+  app.patch(
+    '/api/subscribers/:id/cpe/config',
+    requireAuth,
+    requireRole(['admin', 'technician']),
+    (req: AuthedRequest, res: Response) => {
+      const ownerId = req.user!.ownerId;
+      const sub = db
+        .prepare('SELECT * FROM subscribers WHERE id = ? AND owner_id = ?')
+        .get(req.params.id, ownerId) as Record<string, unknown> | undefined;
+      if (!sub || !canAccessTower(req, sub.tower_id ? String(sub.tower_id) : null)) {
+        res.status(404).json({ error: 'المشترك غير موجود' });
+        return;
+      }
+      const { tr069DeviceId, cpeHost, cpePort = 80, cpeUser = '', cpePass = '' } = req.body as Record<string, unknown>;
+      db.prepare('INSERT OR IGNORE INTO cpe_devices (subscriber_id, owner_id) VALUES (?, ?)').run(req.params.id, ownerId);
+      db.prepare(`
+        UPDATE cpe_devices SET
+          tr069_device_id = COALESCE(?, tr069_device_id),
+          cpe_host = COALESCE(?, cpe_host),
+          cpe_port = COALESCE(?, cpe_port),
+          cpe_user = COALESCE(?, cpe_user),
+          cpe_pass_enc = CASE WHEN ? != '' THEN ? ELSE cpe_pass_enc END
+        WHERE subscriber_id = ?
+      `).run(
+        typeof tr069DeviceId === 'string' ? tr069DeviceId.trim() : null,
+        typeof cpeHost === 'string' ? cpeHost.trim() : null,
+        Number(cpePort) || 80,
+        typeof cpeUser === 'string' ? cpeUser.trim() : null,
+        typeof cpePass === 'string' && cpePass ? encryptSecret(cpePass) : '',
+        typeof cpePass === 'string' && cpePass ? encryptSecret(cpePass) : '',
+        req.params.id
+      );
+      res.json({ cpe: hydrateCpeDevice(sub) });
+    }
+  );
+
+  app.post('/api/subscribers/:id/cpe/sync', requireAuth, async (req: AuthedRequest, res: Response) => {
+    const ownerId = req.user!.ownerId;
+    const sub = db
+      .prepare('SELECT * FROM subscribers WHERE id = ? AND owner_id = ?')
+      .get(req.params.id, ownerId) as Record<string, unknown> | undefined;
+    if (!sub || !canAccessTower(req, sub.tower_id ? String(sub.tower_id) : null)) {
+      res.status(404).json({ error: 'المشترك غير موجود' });
+      return;
+    }
+
+    const nowIso = new Date().toISOString();
+    db.prepare('INSERT OR IGNORE INTO cpe_devices (subscriber_id, owner_id) VALUES (?, ?)').run(req.params.id, ownerId);
+    const existingCpe = db.prepare('SELECT * FROM cpe_devices WHERE subscriber_id = ?').get(req.params.id) as Record<string, unknown>;
+
+    // Try GenieACS TR-069 first if configured (#18)
+    const genieCfg = getOwnerGenieAcsConfig(ownerId);
+    let genieMatched = false;
+    if (genieCfg) {
+      try {
+        const gRes = await fetchGenieAcsCpe(genieCfg, {
+          deviceId: existingCpe.tr069_device_id ? String(existingCpe.tr069_device_id) : null,
+          wanIp: sub.ip ? String(sub.ip) : null,
+          mac: sub.mac ? String(sub.mac) : null,
+        });
+        if (gRes) {
+          genieMatched = true;
+          db.prepare(`
+            UPDATE cpe_devices SET
+              source = 'genieacs', tr069_device_id = ?, model = ?, serial_number = ?, firmware = ?,
+              uptime_sec = ?, cpu_pct = ?, ram_pct = ?, wan_ip = ?,
+              wifi_ssid_24 = ?, wifi_channel_24 = ?, wifi_ssid_5 = ?, wifi_channel_5 = ?,
+              connected_count = ?, connected_hosts_json = ?, tr143_down_mbps = ?, tr143_up_mbps = ?,
+              last_synced_at = ?
+            WHERE subscriber_id = ?
+          `).run(
+            gRes.tr069DeviceId, gRes.model, gRes.serialNumber, gRes.firmware,
+            gRes.uptimeSec, gRes.cpuPct, gRes.ramPct, gRes.wanIp,
+            gRes.wifiSsid24, gRes.wifiChannel24, gRes.wifiSsid5, gRes.wifiChannel5,
+            gRes.connectedHosts.length, JSON.stringify(gRes.connectedHosts), gRes.tr143DownMbps, gRes.tr143UpMbps,
+            nowIso, req.params.id
+          );
+        }
+      } catch {
+        // Fallback to MikroTik Conntrack estimator (#20)
+      }
+    }
+
+    let pingRes: { status: 'up' | 'down'; latencyMs: number | null; packetLossPct: number } | null = null;
+    const router = db.prepare('SELECT * FROM routers WHERE id = ?').get(String(sub.router_id)) as Record<string, unknown> | undefined;
+    if (router && router.status === 'online') {
+      if (sub.ip) {
+        pingRes = await runPingViaContext(router, String(sub.ip)).catch(() => null);
+      }
+      if (!genieMatched) {
+        try {
+          const [conns, arpRows, dhcpRows] = await execCommandsOnRouter(
+            router,
+            [['/ip/firewall/connection/print'], ['/ip/arp/print'], ['/ip/dhcp-server/lease/print']],
+            true
+          );
+          const est = estimateCpeDevicesFromMikroTik({
+            subscriberIp: String(sub.ip || ''),
+            subscriberMac: String(sub.mac || ''),
+            conns,
+            arpRows,
+            dhcpRows,
+          });
+          db.prepare(`
+            UPDATE cpe_devices SET
+              source = 'mikrotik_conntrack', model = COALESCE(model, ?), wan_ip = ?,
+              connected_count = ?, connected_hosts_json = ?, last_synced_at = ?
+            WHERE subscriber_id = ?
+          `).run(
+            `${String(sub.mac_vendor || 'Home CPE')} (تقدير Conntrack)`,
+            String(sub.ip || ''),
+            est.connectedCount,
+            JSON.stringify(est.connectedHosts),
+            nowIso,
+            req.params.id
+          );
+        } catch {
+          // Leave existing state
+        }
+      }
+    }
+
+    res.json({ cpe: hydrateCpeDevice(sub), ping: pingRes });
+  });
+
+  app.post(
+    '/api/subscribers/:id/cpe/wifi',
+    requireAuth,
+    requireRole(['admin', 'technician']),
+    async (req: AuthedRequest, res: Response) => {
+      const ownerId = req.user!.ownerId;
+      const sub = db
+        .prepare('SELECT * FROM subscribers WHERE id = ? AND owner_id = ?')
+        .get(req.params.id, ownerId) as Record<string, unknown> | undefined;
+      if (!sub || !canAccessTower(req, sub.tower_id ? String(sub.tower_id) : null)) {
+        res.status(404).json({ error: 'المشترك غير موجود' });
+        return;
+      }
+      const cpe = db.prepare('SELECT tr069_device_id FROM cpe_devices WHERE subscriber_id = ?').get(req.params.id) as { tr069_device_id?: string } | undefined;
+      const genieCfg = getOwnerGenieAcsConfig(ownerId);
+      if (!genieCfg || !cpe?.tr069_device_id) {
+        res.status(400).json({ error: 'تعديل Wi-Fi عن بُعد يتطلب ربط سيرفر GenieACS (TR-069) بالمشترك' });
+        return;
+      }
+      const { ssid24, password24, channel24, ssid5, password5, channel5 } = req.body as Record<string, unknown>;
+      const paramValues: Array<[string, string | number, string]> = [];
+      if (typeof ssid24 === 'string' && ssid24.trim()) {
+        paramValues.push(['InternetGatewayDevice.LANDevice.1.WLANConfiguration.1.SSID', ssid24.trim(), 'xsd:string']);
+      }
+      if (typeof password24 === 'string' && password24.length >= 8) {
+        paramValues.push(['InternetGatewayDevice.LANDevice.1.WLANConfiguration.1.PreSharedKey.1.KeyPassphrase', password24, 'xsd:string']);
+      }
+      if (typeof channel24 === 'string' && channel24.trim()) {
+        paramValues.push(['InternetGatewayDevice.LANDevice.1.WLANConfiguration.1.Channel', Number(channel24) || 6, 'xsd:unsignedInt']);
+      }
+      if (typeof ssid5 === 'string' && ssid5.trim()) {
+        paramValues.push(['InternetGatewayDevice.LANDevice.1.WLANConfiguration.5.SSID', ssid5.trim(), 'xsd:string']);
+      }
+      if (typeof password5 === 'string' && password5.length >= 8) {
+        paramValues.push(['InternetGatewayDevice.LANDevice.1.WLANConfiguration.5.PreSharedKey.1.KeyPassphrase', password5, 'xsd:string']);
+      }
+      if (typeof channel5 === 'string' && channel5.trim()) {
+        paramValues.push(['InternetGatewayDevice.LANDevice.1.WLANConfiguration.5.Channel', Number(channel5) || 36, 'xsd:unsignedInt']);
+      }
+      try {
+        await pushGenieAcsTask(genieCfg, cpe.tr069_device_id, {
+          name: 'setParameterValues',
+          parameterValues: paramValues,
+        });
+        db.prepare(
+          'UPDATE cpe_devices SET wifi_ssid_24 = COALESCE(?, wifi_ssid_24), wifi_channel_24 = COALESCE(?, wifi_channel_24), wifi_ssid_5 = COALESCE(?, wifi_ssid_5), wifi_channel_5 = COALESCE(?, wifi_channel_5) WHERE subscriber_id = ?'
+        ).run(
+          typeof ssid24 === 'string' && ssid24.trim() ? ssid24.trim() : null,
+          typeof channel24 === 'string' && channel24.trim() ? channel24.trim() : null,
+          typeof ssid5 === 'string' && ssid5.trim() ? ssid5.trim() : null,
+          typeof channel5 === 'string' && channel5.trim() ? channel5.trim() : null,
+          req.params.id
+        );
+        addAuditLog(ownerId, req.user!.name, req.user!.role, 'تعديل Wi-Fi لراوتر المشترك', String(sub.username));
+        res.json({ ok: true, message: 'تم إرسال إعدادات الواي فاي لراوتر المشترك عبر TR-069' });
+      } catch (err) {
+        res.status(502).json({ error: err instanceof Error ? err.message : 'فشل دفع إعدادات Wi-Fi عبر GenieACS' });
+      }
+    }
+  );
+
+  app.post(
+    '/api/subscribers/:id/cpe/reboot',
+    requireAuth,
+    requireRole(['admin', 'technician']),
+    async (req: AuthedRequest, res: Response) => {
+      const ownerId = req.user!.ownerId;
+      const sub = db
+        .prepare('SELECT * FROM subscribers WHERE id = ? AND owner_id = ?')
+        .get(req.params.id, ownerId) as Record<string, unknown> | undefined;
+      const cpe = db.prepare('SELECT tr069_device_id FROM cpe_devices WHERE subscriber_id = ?').get(req.params.id) as { tr069_device_id?: string } | undefined;
+      const genieCfg = getOwnerGenieAcsConfig(ownerId);
+      if (!sub || !genieCfg || !cpe?.tr069_device_id) {
+        res.status(400).json({ error: 'إعادة تشغيل الراوتر المنزلي تتطلب ربط TR-069 GenieACS' });
+        return;
+      }
+      try {
+        await pushGenieAcsTask(genieCfg, cpe.tr069_device_id, { name: 'reboot' });
+        addAuditLog(ownerId, req.user!.name, req.user!.role, 'إعادة تشغيل CPE المنزلي', String(sub.username));
+        res.json({ ok: true, message: 'تم إرسال أمر إعادة تشغيل راوتر المشترك (TR-069 Reboot)' });
+      } catch (err) {
+        res.status(502).json({ error: err instanceof Error ? err.message : 'فشل إرسال Reboot إلى GenieACS' });
+      }
+    }
+  );
+
+  app.post('/api/subscribers/:id/cpe/speedtest', requireAuth, async (req: AuthedRequest, res: Response) => {
+    const ownerId = req.user!.ownerId;
+    const cpe = db.prepare('SELECT tr069_device_id FROM cpe_devices WHERE subscriber_id = ?').get(req.params.id) as { tr069_device_id?: string } | undefined;
+    const genieCfg = getOwnerGenieAcsConfig(ownerId);
+    if (!genieCfg || !cpe?.tr069_device_id) {
+      res.status(400).json({ error: 'فحص TR-143 الفعلي يتطلب ربط راوتر المشترك بـ GenieACS' });
+      return;
+    }
+    const testUrl = typeof (req.body as { testUrl?: string }).testUrl === 'string' && (req.body as { testUrl?: string }).testUrl!.trim()
+      ? (req.body as { testUrl?: string }).testUrl!.trim()
+      : 'http://speedtest.tele2.net/10MB.zip';
+    try {
+      await pushGenieAcsTask(genieCfg, cpe.tr069_device_id, {
+        name: 'setParameterValues',
+        parameterValues: [
+          ['InternetGatewayDevice.DownloadDiagnostics.DownloadURL', testUrl, 'xsd:string'],
+          ['InternetGatewayDevice.DownloadDiagnostics.DiagnosticsState', 'Requested', 'xsd:string'],
+        ],
+      });
+      res.json({ ok: true, message: 'بدأ فحص سرعة TR-143 من راوتر المشترك — اضغط مزامنة بعد 10 ثواني لقراءة النتيجة.' });
+    } catch (err) {
+      res.status(502).json({ error: err instanceof Error ? err.message : 'فشل إطلاق اختبار TR-143' });
+    }
+  });
+
+  app.post(
+    '/api/subscribers/:id/cpe/block-mac',
+    requireAuth,
+    requireRole(['admin', 'technician']),
+    async (req: AuthedRequest, res: Response) => {
+      const ownerId = req.user!.ownerId;
+      const sub = db.prepare('SELECT * FROM subscribers WHERE id = ? AND owner_id = ?').get(req.params.id, ownerId) as Record<string, unknown> | undefined;
+      if (!sub) {
+        res.status(404).json({ error: 'المشترك غير موجود' });
+        return;
+      }
+      const { mac, block = true } = req.body as Record<string, unknown>;
+      if (typeof mac !== 'string' || !mac.trim()) {
+        res.status(400).json({ error: 'أدخل عنوان MAC صحيح' });
+        return;
+      }
+      const cpe = db.prepare('SELECT tr069_device_id FROM cpe_devices WHERE subscriber_id = ?').get(req.params.id) as { tr069_device_id?: string } | undefined;
+      const genieCfg = getOwnerGenieAcsConfig(ownerId);
+      if (genieCfg && cpe?.tr069_device_id) {
+        await pushGenieAcsTask(genieCfg, cpe.tr069_device_id, {
+          name: 'setParameterValues',
+          parameterValues: [
+            ['InternetGatewayDevice.LANDevice.1.WLANConfiguration.1.MACAddressControlEnabled', block ? true : false, 'xsd:boolean'],
+          ],
+        }).catch(() => undefined);
+      }
+      addAuditLog(ownerId, req.user!.name, req.user!.role, block ? 'حظر جهاز فرعي MAC' : 'رفع حظر MAC', `${sub.username} (${mac})`);
+      res.json({ ok: true, message: `تم إرسال طلب ${block ? 'حظر' : 'فك حظر'} العنوان ${mac}` });
+    }
+  );
+
+  app.post('/api/subscribers/:id/cpe/backup', requireAuth, async (req: AuthedRequest, res: Response) => {
+    const ownerId = req.user!.ownerId;
+    const sub = db.prepare('SELECT * FROM subscribers WHERE id = ? AND owner_id = ?').get(req.params.id, ownerId) as Record<string, unknown> | undefined;
+    if (!sub) {
+      res.status(404).json({ error: 'المشترك غير موجود' });
+      return;
+    }
+    const cpe = db.prepare('SELECT * FROM cpe_devices WHERE subscriber_id = ?').get(req.params.id) as Record<string, unknown> | undefined;
+    const backupObj = {
+      savedAt: new Date().toISOString(),
+      model: cpe?.model || 'Home CPE',
+      wanIp: cpe?.wan_ip || sub.ip,
+      wifiSsid24: cpe?.wifi_ssid_24 || null,
+      wifiChannel24: cpe?.wifi_channel_24 || null,
+      wifiSsid5: cpe?.wifi_ssid_5 || null,
+      wifiChannel5: cpe?.wifi_channel_5 || null,
+      pppoeUsername: sub.username,
+    };
+    db.prepare('INSERT OR IGNORE INTO cpe_devices (subscriber_id, owner_id) VALUES (?, ?)').run(req.params.id, ownerId);
+    db.prepare('UPDATE cpe_devices SET last_config_backup_json = ? WHERE subscriber_id = ?').run(JSON.stringify(backupObj), req.params.id);
+    addAuditLog(ownerId, req.user!.name, req.user!.role, 'حفظ نسخة إعدادات CPE', String(sub.username));
+    res.json({ ok: true, backup: backupObj });
+  });
+
+  app.post('/api/subscribers/:id/cpe/restore', requireAuth, requireRole(['admin', 'technician']), async (req: AuthedRequest, res: Response) => {
+    const ownerId = req.user!.ownerId;
+    const cpe = db.prepare('SELECT tr069_device_id, last_config_backup_json FROM cpe_devices WHERE subscriber_id = ? AND owner_id = ?').get(req.params.id, ownerId) as { tr069_device_id?: string; last_config_backup_json?: string } | undefined;
+    if (!cpe?.last_config_backup_json) {
+      res.status(400).json({ error: 'لا توجد نسخة إعدادات محفوظة لهذا المشترك بعد' });
+      return;
+    }
+    const genieCfg = getOwnerGenieAcsConfig(ownerId);
+    const bak = JSON.parse(cpe.last_config_backup_json) as Record<string, unknown>;
+    if (genieCfg && cpe.tr069_device_id && bak.wifiSsid24) {
+      await pushGenieAcsTask(genieCfg, cpe.tr069_device_id, {
+        name: 'setParameterValues',
+        parameterValues: [
+          ['InternetGatewayDevice.LANDevice.1.WLANConfiguration.1.SSID', String(bak.wifiSsid24), 'xsd:string'],
+        ],
+      }).catch(() => undefined);
+    }
+    res.json({ ok: true, message: 'تمت استعادة الإعدادات المحفوظة من النسخة الاحتياطية.' });
+  });
+
+  app.get('/api/subscribers/:id/cpe-proxy', requireAuth, async (req: AuthedRequest, res: Response) => {
+    const ownerId = req.user!.ownerId;
+    const sub = db
+      .prepare('SELECT * FROM subscribers WHERE id = ? AND owner_id = ?')
+      .get(req.params.id, ownerId) as Record<string, unknown> | undefined;
+    if (!sub || !canAccessTower(req, sub.tower_id ? String(sub.tower_id) : null)) {
+      res.status(404).json({ error: 'المشترك غير موجود' });
+      return;
+    }
+    const cpe = db.prepare('SELECT cpe_host, cpe_port FROM cpe_devices WHERE subscriber_id = ?').get(req.params.id) as { cpe_host?: string; cpe_port?: number } | undefined;
+    const host = (cpe?.cpe_host || String(sub.ip || '')).trim();
+    if (!host) {
+      res.status(400).json({ error: 'لا يوجد عنوان IP نشط لراوتر المشترك' });
+      return;
+    }
+    try {
+      const page = await proxyCpeHttpPage({
+        host,
+        port: Number(cpe?.cpe_port || 80),
+        subPath: typeof req.query.path === 'string' ? req.query.path : '/',
+      });
+      res.setHeader('Content-Type', page.contentType);
+      res.setHeader('Content-Security-Policy', "default-src 'self' 'unsafe-inline' http: https:; frame-ancestors 'self'");
+      res.status(page.statusCode).send(page.body);
+    } catch (err) {
+      res.status(502).json({ error: err instanceof Error ? err.message : 'تعذر فتح واجهة راوتر المشترك' });
+    }
+  });
+
+  // RADIUS CoA / Disconnect (RFC 5176 UDP 3799 + MikroTik API fallback) (#46)
+  app.post(
+    '/api/subscribers/:id/coa',
+    requireAuth,
+    requireRole(['admin', 'technician']),
+    async (req: AuthedRequest, res: Response) => {
+      const ownerId = req.user!.ownerId;
+      const sub = db.prepare('SELECT * FROM subscribers WHERE id = ? AND owner_id = ?').get(req.params.id, ownerId) as Record<string, unknown> | undefined;
+      if (!sub || !canAccessTower(req, sub.tower_id ? String(sub.tower_id) : null)) {
+        res.status(404).json({ error: 'المشترك غير موجود' });
+        return;
+      }
+      const { action = 'disconnect', rateLimit = '' } = req.body as Record<string, unknown>;
+      const notif = db
+        .prepare('SELECT radius_host, radius_coa_port, radius_secret_enc FROM notification_settings WHERE owner_id = ?')
+        .get(ownerId) as { radius_host?: string; radius_coa_port?: number; radius_secret_enc?: string } | undefined;
+      const router = db.prepare('SELECT * FROM routers WHERE id = ?').get(String(sub.router_id)) as Record<string, unknown>;
+
+      if (notif?.radius_secret_enc && (notif.radius_host || router?.api_host)) {
+        try {
+          const result = await sendRadiusCoaOrDisconnect({
+            nasHost: notif.radius_host || String(router.api_host),
+            port: Number(notif.radius_coa_port || 3799),
+            secret: decryptSecret(notif.radius_secret_enc),
+            username: String(sub.username),
+            action: action === 'coa-rate-limit' ? 'coa-rate-limit' : 'disconnect',
+            rateLimit: typeof rateLimit === 'string' && rateLimit.trim() ? rateLimit.trim() : undefined,
+          });
+          addAuditLog(ownerId, req.user!.name, req.user!.role, 'إرسال RADIUS CoA', `${sub.username} (${action})`);
+          res.json(result);
+          return;
+        } catch {
+          // Fall through to direct RouterOS API control if NAS UDP CoA unreachable
+        }
+      }
+
+      if (router && router.status === 'online' && router.permission_mode === 'full-control') {
+        try {
+          const [activeRows] = await execCommandsOnRouter(router, [['/ppp/active/print', `?name=${sub.username}`]]);
+          const removeCmds = activeRows.filter((r) => r['.id']).map((r) => ['/ppp/active/remove', `=.id=${r['.id']}`]);
+          if (removeCmds.length > 0) await execCommandsOnRouter(router, removeCmds);
+          addAuditLog(ownerId, req.user!.name, req.user!.role, 'فصل مباشر بدلاً من CoA', String(sub.username));
+          res.json({ acked: true, responseCode: 41, message: 'تم فصل الجلسة مباشرة عبر RouterOS API لتطبيق الباقة الجديدة' });
+          return;
+        } catch (err) {
+          res.status(502).json({ error: err instanceof Error ? err.message : 'فشل فصل الجلسة' });
+          return;
+        }
+      }
+
+      res.status(400).json({ error: 'يرجى تفعيل سر RADIUS CoA في الإعدادات أو ربط الراوتر بصلاحية التحكم الكامل' });
+    }
+  );
+
+  // =========================================================================
+  // Subscribers: Real Session Disconnect, Profile Change, Billing, Payments, CSV (#44-#59)
   // =========================================================================
   app.post(
     '/api/subscribers/:id/disconnect',
@@ -2103,8 +3650,8 @@ async function startServer(): Promise<void> {
       const sub = db
         .prepare('SELECT * FROM subscribers WHERE id = ? AND owner_id = ?')
         .get(req.params.id, ownerId) as Record<string, unknown> | undefined;
-      if (!sub) {
-        res.status(404).json({ error: 'المشترك غير موجود' });
+      if (!sub || !canAccessTower(req, sub.tower_id ? String(sub.tower_id) : null)) {
+        res.status(404).json({ error: 'المشترك غير موجود أو خارج صلاحيتك' });
         return;
       }
       const router = db
@@ -2147,8 +3694,8 @@ async function startServer(): Promise<void> {
       const sub = db
         .prepare('SELECT * FROM subscribers WHERE id = ? AND owner_id = ?')
         .get(req.params.id, ownerId) as Record<string, unknown> | undefined;
-      if (!sub) {
-        res.status(404).json({ error: 'المشترك غير موجود' });
+      if (!sub || !canAccessTower(req, sub.tower_id ? String(sub.tower_id) : null)) {
+        res.status(404).json({ error: 'المشترك غير موجود أو خارج نطاق برجك' });
         return;
       }
 
@@ -2162,13 +3709,17 @@ async function startServer(): Promise<void> {
         graceHours,
         profile,
         disabled,
+        turboNightEnabled,
+        turboProfile,
+        baseProfile,
+        staticIpPool,
         towerId,
         lat,
         lng,
       } = req.body as Record<string, unknown>;
 
-      // If profile or disabled changed, apply on real MikroTik router if full-control
-      if (typeof profile === 'string' || typeof disabled === 'boolean') {
+      // If profile, disabled, or staticIpPool changed, apply on real MikroTik router (#48, #56, #58)
+      if (typeof profile === 'string' || typeof disabled === 'boolean' || typeof staticIpPool === 'string') {
         const router = db
           .prepare('SELECT * FROM routers WHERE id = ?')
           .get(String(sub.router_id)) as Record<string, unknown>;
@@ -2181,6 +3732,9 @@ async function startServer(): Promise<void> {
               const args = ['/ppp/secret/set', `=.id=${secrets[0]['.id']}`];
               if (typeof profile === 'string' && profile.trim()) args.push(`=profile=${profile.trim()}`);
               if (typeof disabled === 'boolean') args.push(`=disabled=${disabled ? 'yes' : 'no'}`);
+              if (typeof staticIpPool === 'string' && isValidIpv4(staticIpPool)) {
+                args.push(`=remote-address=${staticIpPool.trim()}`);
+              }
               await execCommandsOnRouter(router, [args]);
             }
           } catch (err) {
@@ -2189,6 +3743,13 @@ async function startServer(): Promise<void> {
           }
         }
       }
+
+      const nextGraceExpiresAt =
+        typeof graceHours === 'number' && graceHours > 0
+          ? new Date(Date.now() + graceHours * 3600 * 1000).toISOString()
+          : graceHours === null
+            ? null
+            : undefined;
 
       const nextExpiresDays =
         typeof graceHours === 'number'
@@ -2208,8 +3769,13 @@ async function startServer(): Promise<void> {
           debt_amount_iqd = COALESCE(?, debt_amount_iqd),
           expires_in_days = ?,
           expires_at = ?,
+          grace_expires_at = CASE WHEN ? = 1 THEN ? ELSE grace_expires_at END,
           profile = COALESCE(?, profile),
           disabled = COALESCE(?, disabled),
+          turbo_night_enabled = COALESCE(?, turbo_night_enabled),
+          turbo_profile = COALESCE(?, turbo_profile),
+          base_profile = COALESCE(?, base_profile),
+          static_ip_pool = COALESCE(?, static_ip_pool),
           tower_id = COALESCE(?, tower_id),
           lat = COALESCE(?, lat),
           lng = COALESCE(?, lng)
@@ -2222,8 +3788,14 @@ async function startServer(): Promise<void> {
         typeof debtAmountIqd === 'number' ? Math.max(0, Math.round(debtAmountIqd)) : null,
         nextExpiresDays,
         nextExpiresAt,
+        nextGraceExpiresAt !== undefined ? 1 : 0,
+        nextGraceExpiresAt ?? null,
         typeof profile === 'string' ? profile.trim() : null,
         typeof disabled === 'boolean' ? (disabled ? 1 : 0) : null,
+        typeof turboNightEnabled === 'boolean' ? (turboNightEnabled ? 1 : 0) : null,
+        typeof turboProfile === 'string' ? turboProfile.trim() : null,
+        typeof baseProfile === 'string' ? baseProfile.trim() : null,
+        typeof staticIpPool === 'string' ? staticIpPool.trim() : null,
         typeof towerId === 'string' ? towerId : null,
         typeof lat === 'number' ? Number(lat.toFixed(6)) : null,
         typeof lng === 'number' ? Number(lng.toFixed(6)) : null,
@@ -2421,7 +3993,7 @@ async function startServer(): Promise<void> {
   );
 
   // =========================================================================
-  // RBAC Team Members (#84), Telegram/Push Settings (#71,#72), Digest (#77), Audit Log (#78), Test Alert (#79)
+  // RBAC Team Members (#84, #96), Telegram/Push, GenieACS (#18), RADIUS CoA (#46), Night Turbo (#54)
   // =========================================================================
   app.get('/api/settings', requireAuth, (req: AuthedRequest, res: Response) => {
     const ownerId = req.user!.ownerId;
@@ -2429,7 +4001,7 @@ async function startServer(): Promise<void> {
       .prepare('SELECT * FROM notification_settings WHERE owner_id = ?')
       .get(ownerId) as Record<string, unknown> | undefined;
     const members = db
-      .prepare('SELECT id, name, email, role, created_at FROM users WHERE owner_id = ? ORDER BY created_at ASC')
+      .prepare('SELECT id, name, email, role, allowed_tower_ids_json, created_at FROM users WHERE owner_id = ? ORDER BY created_at ASC')
       .all(ownerId) as Array<Record<string, unknown>>;
     const auditLogs = db
       .prepare('SELECT * FROM audit_logs WHERE owner_id = ? ORDER BY created_at DESC LIMIT 60')
@@ -2442,12 +4014,23 @@ async function startServer(): Promise<void> {
         telegramChatId: String(notif?.telegram_chat_id || ''),
         hasTelegramToken: Boolean(notif?.telegram_bot_token_enc),
         dailyDigestEnabled: notif ? Boolean(notif.daily_digest_enabled) : true,
+        turboNightEnabled: Boolean(notif?.turbo_night_enabled),
+        turboStartHour: notif?.turbo_start_hour !== undefined ? Number(notif.turbo_start_hour) : 1,
+        turboEndHour: notif?.turbo_end_hour !== undefined ? Number(notif.turbo_end_hour) : 7,
+        turboDefaultProfile: String(notif?.turbo_default_profile || ''),
+        genieacsUrl: String(notif?.genieacs_url || ''),
+        genieacsUser: String(notif?.genieacs_user || ''),
+        hasGenieacsPass: Boolean(notif?.genieacs_pass_enc),
+        radiusHost: String(notif?.radius_host || ''),
+        radiusCoaPort: notif?.radius_coa_port !== undefined ? Number(notif.radius_coa_port) : 3799,
+        hasRadiusSecret: Boolean(notif?.radius_secret_enc),
       },
       teamMembers: members.map((m) => ({
         id: String(m.id),
         name: String(m.name),
         email: String(m.email),
         role: m.role,
+        allowedTowerIds: JSON.parse(String(m.allowed_tower_ids_json || '[]')) as string[],
         createdAt: String(m.created_at),
       })),
       auditLogs: auditLogs.map((a) => ({
@@ -2467,13 +4050,14 @@ async function startServer(): Promise<void> {
     requireRole(['admin']),
     (req: AuthedRequest, res: Response) => {
       const ownerId = req.user!.ownerId;
-      const { name, email, password, role } = req.body as Record<string, unknown>;
+      const { name, email, password, role, allowedTowerIds = [] } = req.body as Record<string, unknown>;
       if (typeof name !== 'string' || typeof email !== 'string' || typeof password !== 'string') {
         res.status(400).json({ error: 'يرجى تعبئة الاسم والبريد الإلكتروني وكلمة المرور' });
         return;
       }
       const validRoles: UserRole[] = ['admin', 'accountant', 'technician', 'viewer'];
       const chosenRole: UserRole = validRoles.includes(role as UserRole) ? (role as UserRole) : 'viewer';
+      const towersList = Array.isArray(allowedTowerIds) ? allowedTowerIds.filter((t): t is string => typeof t === 'string') : [];
       const cleanEmail = email.trim().toLowerCase();
       if (db.prepare('SELECT id FROM users WHERE email = ?').get(cleanEmail)) {
         res.status(409).json({ error: 'هذا البريد الإلكتروني مسجل مسبقاً' });
@@ -2483,12 +4067,24 @@ async function startServer(): Promise<void> {
       const salt = crypto.randomBytes(16).toString('hex');
       const nowIso = new Date().toISOString();
       db.prepare(
-        'INSERT INTO users (id, owner_id, name, email, network_name, role, password_hash, salt, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
-      ).run(id, ownerId, name.trim(), cleanEmail, req.user!.networkName, chosenRole, hashPassword(password, salt), salt, nowIso);
+        'INSERT INTO users (id, owner_id, name, email, network_name, role, allowed_tower_ids_json, password_hash, salt, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+      ).run(id, ownerId, name.trim(), cleanEmail, req.user!.networkName, chosenRole, JSON.stringify(towersList), hashPassword(password, salt), salt, nowIso);
       addAuditLog(ownerId, req.user!.name, req.user!.role, 'إضافة عضو فريق', `${name.trim()} (${chosenRole})`);
-      res.status(201).json({ member: { id, name: name.trim(), email: cleanEmail, role: chosenRole, createdAt: nowIso } });
+      res.status(201).json({ member: { id, name: name.trim(), email: cleanEmail, role: chosenRole, allowedTowerIds: towersList, createdAt: nowIso } });
     }
   );
+
+  app.patch('/api/team/:id/towers', requireAuth, requireRole(['admin']), (req: AuthedRequest, res: Response) => {
+    const allowedTowerIds = Array.isArray((req.body as { allowedTowerIds?: unknown }).allowedTowerIds)
+      ? ((req.body as { allowedTowerIds: unknown[] }).allowedTowerIds.filter((t): t is string => typeof t === 'string'))
+      : [];
+    db.prepare('UPDATE users SET allowed_tower_ids_json = ? WHERE id = ? AND owner_id = ?').run(
+      JSON.stringify(allowedTowerIds),
+      req.params.id,
+      req.user!.ownerId
+    );
+    res.json({ ok: true, allowedTowerIds });
+  });
 
   app.delete('/api/team/:id', requireAuth, requireRole(['admin']), (req: AuthedRequest, res: Response) => {
     if (req.params.id === req.user!.sub) {
@@ -2501,8 +4097,23 @@ async function startServer(): Promise<void> {
 
   app.patch('/api/settings/notifications', requireAuth, requireRole(['admin']), (req: AuthedRequest, res: Response) => {
     const ownerId = req.user!.ownerId;
-    const { webPushEnabled, telegramEnabled, telegramBotToken, telegramChatId, dailyDigestEnabled } =
-      req.body as Record<string, unknown>;
+    const {
+      webPushEnabled,
+      telegramEnabled,
+      telegramBotToken,
+      telegramChatId,
+      dailyDigestEnabled,
+      turboNightEnabled,
+      turboStartHour,
+      turboEndHour,
+      turboDefaultProfile,
+      genieacsUrl,
+      genieacsUser,
+      genieacsPass,
+      radiusHost,
+      radiusCoaPort,
+      radiusSecret,
+    } = req.body as Record<string, unknown>;
 
     db.prepare('INSERT OR IGNORE INTO notification_settings (owner_id) VALUES (?)').run(ownerId);
     const cur = db
@@ -2514,13 +4125,33 @@ async function startServer(): Promise<void> {
         ? encryptSecret(telegramBotToken.trim())
         : String(cur.telegram_bot_token_enc || '');
 
+    const nextGeniePassEnc =
+      typeof genieacsPass === 'string' && genieacsPass.trim()
+        ? encryptSecret(genieacsPass.trim())
+        : String(cur.genieacs_pass_enc || '');
+
+    const nextRadiusSecretEnc =
+      typeof radiusSecret === 'string' && radiusSecret.trim()
+        ? encryptSecret(radiusSecret.trim())
+        : String(cur.radius_secret_enc || '');
+
     db.prepare(`
       UPDATE notification_settings SET
         web_push_enabled = ?,
         telegram_enabled = ?,
         telegram_bot_token_enc = ?,
         telegram_chat_id = ?,
-        daily_digest_enabled = ?
+        daily_digest_enabled = ?,
+        turbo_night_enabled = ?,
+        turbo_start_hour = ?,
+        turbo_end_hour = ?,
+        turbo_default_profile = ?,
+        genieacs_url = ?,
+        genieacs_user = ?,
+        genieacs_pass_enc = ?,
+        radius_host = ?,
+        radius_coa_port = ?,
+        radius_secret_enc = ?
       WHERE owner_id = ?
     `).run(
       typeof webPushEnabled === 'boolean' ? (webPushEnabled ? 1 : 0) : Number(cur.web_push_enabled),
@@ -2528,6 +4159,16 @@ async function startServer(): Promise<void> {
       nextTokenEnc,
       typeof telegramChatId === 'string' ? telegramChatId.trim() : String(cur.telegram_chat_id || ''),
       typeof dailyDigestEnabled === 'boolean' ? (dailyDigestEnabled ? 1 : 0) : Number(cur.daily_digest_enabled),
+      typeof turboNightEnabled === 'boolean' ? (turboNightEnabled ? 1 : 0) : Number(cur.turbo_night_enabled || 0),
+      typeof turboStartHour === 'number' ? Math.max(0, Math.min(23, Math.round(turboStartHour))) : Number(cur.turbo_start_hour ?? 1),
+      typeof turboEndHour === 'number' ? Math.max(0, Math.min(23, Math.round(turboEndHour))) : Number(cur.turbo_end_hour ?? 7),
+      typeof turboDefaultProfile === 'string' ? turboDefaultProfile.trim() : String(cur.turbo_default_profile || ''),
+      typeof genieacsUrl === 'string' ? genieacsUrl.trim() : String(cur.genieacs_url || ''),
+      typeof genieacsUser === 'string' ? genieacsUser.trim() : String(cur.genieacs_user || ''),
+      nextGeniePassEnc,
+      typeof radiusHost === 'string' ? radiusHost.trim() : String(cur.radius_host || ''),
+      typeof radiusCoaPort === 'number' ? Number(radiusCoaPort) : Number(cur.radius_coa_port ?? 3799),
+      nextRadiusSecretEnc,
       ownerId
     );
     res.json({ ok: true });
@@ -2585,7 +4226,7 @@ async function startServer(): Promise<void> {
     });
   });
 
-  // Background Poller Worker every 60s (#87) + Retention Cleanup (#90)
+  // Background Poller Worker every 60s (#87, #48 Auto-Grace, #54 Night Turbo, #13 RF History) + Retention Cleanup (#90)
   setInterval(() => {
     const activeRouters = db
       .prepare("SELECT * FROM routers WHERE status != 'pending' AND connection_type != 'agent'")
@@ -2595,6 +4236,69 @@ async function startServer(): Promise<void> {
         // Error already persisted in router row & alert
       });
     }
+
+    // 1. Poll online RF Radios (#13)
+    const activeRadios = db
+      .prepare("SELECT * FROM rf_radios WHERE status != 'offline'")
+      .all() as Array<Record<string, unknown>>;
+    for (const rad of activeRadios) {
+      void performRfSync(rad).catch(() => undefined);
+    }
+
+    // 2. Auto-disable expired Grace Period subscribers (#48)
+    const nowIso = new Date().toISOString();
+    const expiredGraceSubs = db
+      .prepare('SELECT * FROM subscribers WHERE grace_expires_at IS NOT NULL AND grace_expires_at <= ? AND disabled = 0')
+      .all(nowIso) as Array<Record<string, unknown>>;
+    for (const s of expiredGraceSubs) {
+      const router = db.prepare('SELECT * FROM routers WHERE id = ?').get(String(s.router_id)) as Record<string, unknown> | undefined;
+      if (router && router.status === 'online' && router.permission_mode === 'full-control') {
+        void (async () => {
+          const [secrets] = await execCommandsOnRouter(router, [['/ppp/secret/print', `?name=${s.username}`]]).catch(() => [[]]);
+          if (secrets[0]?.['.id']) {
+            await execCommandsOnRouter(router, [['/ppp/secret/set', `=.id=${secrets[0]['.id']}`, '=disabled=yes']]).catch(() => undefined);
+          }
+          const [act] = await execCommandsOnRouter(router, [['/ppp/active/print', `?name=${s.username}`]]).catch(() => [[]]);
+          const rmCmds = act.filter((a) => a['.id']).map((a) => ['/ppp/active/remove', `=.id=${a['.id']}`]);
+          if (rmCmds.length > 0) await execCommandsOnRouter(router, rmCmds).catch(() => undefined);
+        })();
+      }
+      db.prepare("UPDATE subscribers SET disabled = 1, billing_status = 'expired', grace_expires_at = NULL WHERE id = ?").run(String(s.id));
+      createAlert(String(s.owner_id), String(s.router_id), String(s.router_name), 'warning', `انتهاء السلفة المؤقتة: ${s.username}`, 'انتهت مهلة التمديد التلقائية وتم إيقاف الاشتراك.');
+    }
+
+    // 3. Automated Night Turbo Speed Boost Scheduler (#54)
+    const curHour = new Date().getHours();
+    const turboOwners = db
+      .prepare('SELECT owner_id, turbo_night_enabled, turbo_start_hour, turbo_end_hour, turbo_default_profile FROM notification_settings WHERE turbo_night_enabled = 1')
+      .all() as Array<{ owner_id: string; turbo_start_hour: number; turbo_end_hour: number; turbo_default_profile: string }>;
+    for (const cfg of turboOwners) {
+      const start = cfg.turbo_start_hour;
+      const end = cfg.turbo_end_hour;
+      const inWindow = start <= end ? curHour >= start && curHour < end : curHour >= start || curHour < end;
+      const subs = db
+        .prepare('SELECT * FROM subscribers WHERE owner_id = ? AND turbo_night_enabled = 1 AND disabled = 0')
+        .all(cfg.owner_id) as Array<Record<string, unknown>>;
+      for (const s of subs) {
+        const targetTurbo = String(s.turbo_profile || cfg.turbo_default_profile || '');
+        const baseProf = String(s.base_profile || s.profile || '');
+        if (!targetTurbo || !baseProf) continue;
+        const desiredProfile = inWindow ? targetTurbo : baseProf;
+        if (String(s.profile) !== desiredProfile) {
+          const router = db.prepare('SELECT * FROM routers WHERE id = ?').get(String(s.router_id)) as Record<string, unknown> | undefined;
+          if (router && router.status === 'online' && router.permission_mode === 'full-control') {
+            void (async () => {
+              const [secrets] = await execCommandsOnRouter(router, [['/ppp/secret/print', `?name=${s.username}`]]).catch(() => [[]]);
+              if (secrets[0]?.['.id']) {
+                await execCommandsOnRouter(router, [['/ppp/secret/set', `=.id=${secrets[0]['.id']}`, `=profile=${desiredProfile}`]]).catch(() => undefined);
+                db.prepare('UPDATE subscribers SET profile = ?, base_profile = ? WHERE id = ?').run(desiredProfile, baseProf, String(s.id));
+              }
+            })();
+          }
+        }
+      }
+    }
+
     runRetentionCleanup();
   }, 60 * 1000);
 

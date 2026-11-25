@@ -802,6 +802,42 @@ export async function fetchRealRouterSnapshot(
       }
     }
 
+    // Fetch PoE-Out status (#33) & SFP DOM optical telemetry (#32)
+    const poeRows = await safeCmd(['/interface/ethernet/poe/print']);
+    const poeMap = new Map<string, { status: string | null; watts: number | null; voltage: number | null }>();
+    const poeNames = poeRows.map((p) => p.name).filter(Boolean);
+    if (poeNames.length > 0) {
+      const poeMon = await safeCmd(['/interface/ethernet/poe/monitor', `=numbers=${poeNames.join(',')}`, '=once=']);
+      for (const pm of poeMon) {
+        const pname = pm.name || '';
+        if (!pname) continue;
+        const pwr = pm['poe-out-power'] ? Number(pm['poe-out-power']) : null;
+        const volt = pm['poe-out-voltage'] ? Number(pm['poe-out-voltage']) : null;
+        poeMap.set(pname, {
+          status: pm['poe-out-status'] || null,
+          watts: pwr !== null && Number.isFinite(pwr) ? Number(pwr.toFixed(1)) : null,
+          voltage: volt !== null && Number.isFinite(volt) ? Number(volt.toFixed(1)) : null,
+        });
+      }
+    }
+
+    const sfpNames = allIfaces.filter((i) => i.type === 'sfp' && i.row.running === 'true').map((i) => i.row.name);
+    const sfpDomMap = new Map<string, { tempC: number | null; rxDbm: number | null; txDbm: number | null; voltageV: number | null; biasMa: number | null }>();
+    if (sfpNames.length > 0) {
+      const sfpMon = await safeCmd(['/interface/ethernet/monitor', `=numbers=${sfpNames.join(',')}`, '=once=']);
+      for (const sm of sfpMon) {
+        const sname = sm.name || '';
+        if (!sname) continue;
+        sfpDomMap.set(sname, {
+          tempC: sm['sfp-temperature'] ? Number(sm['sfp-temperature']) : null,
+          rxDbm: sm['sfp-rx-power'] ? Number(sm['sfp-rx-power']) : null,
+          txDbm: sm['sfp-tx-power'] ? Number(sm['sfp-tx-power']) : null,
+          voltageV: sm['sfp-supply-voltage'] ? Number(sm['sfp-supply-voltage']) : null,
+          biasMa: sm['sfp-tx-bias-current'] ? Number(sm['sfp-tx-bias-current']) : null,
+        });
+      }
+    }
+
     const ports: RouterPort[] = allIfaces.map(({ row, type }) => {
       const name = row.name || 'ether';
       const prev = prevMap.get(name);
@@ -817,6 +853,8 @@ export async function fetchRealRouterSnapshot(
               : rawRate || '1G'
         : 'down';
       const t = trafficByIface.get(name);
+      const poe = poeMap.get(name);
+      const sfp = sfpDomMap.get(name);
 
       return {
         id: name,
@@ -833,11 +871,17 @@ export async function fetchRealRouterSnapshot(
         txMbps: t?.txMbps ?? 0,
         rxBytesToday: Number(row['rx-byte'] || 0),
         txBytesToday: Number(row['tx-byte'] || 0),
-        rxErrors: Number(row['rx-fcs-error'] || 0),
+        rxErrors: Number(row['rx-fcs-error'] || row['rx-code-error'] || 0),
         rxDrops: Number(row['rx-drop'] || 0),
-        sfpTempC: row['sfp-temperature'] ? Number(row['sfp-temperature']) : null,
-        sfpRxDbm: row['sfp-rx-power'] ? Number(row['sfp-rx-power']) : null,
-        sfpTxDbm: row['sfp-tx-power'] ? Number(row['sfp-tx-power']) : null,
+        txDrops: Number(row['tx-drop'] || 0),
+        poeStatus: poe?.status ?? null,
+        poeWatts: poe?.watts ?? null,
+        poeVoltage: poe?.voltage ?? null,
+        sfpTempC: sfp?.tempC ?? (row['sfp-temperature'] ? Number(row['sfp-temperature']) : null),
+        sfpRxDbm: sfp?.rxDbm ?? (row['sfp-rx-power'] ? Number(row['sfp-rx-power']) : null),
+        sfpTxDbm: sfp?.txDbm ?? (row['sfp-tx-power'] ? Number(row['sfp-tx-power']) : null),
+        sfpVoltageV: sfp?.voltageV ?? null,
+        sfpBiasMa: sfp?.biasMa ?? null,
         disconnectCount: prev?.disconnectCount ?? 0,
         lastDisconnect: prev?.lastDisconnect,
       };
@@ -914,3 +958,118 @@ export async function runPingOnRouter(
     client.close();
   }
 }
+
+export function parseTorchRows(rows: RosRow[]) {
+  return rows
+    .filter((r) => r['src-address'] || r['dst-address'])
+    .slice(0, 30)
+    .map((r) => ({
+      srcAddress: r['src-address'] || '-',
+      dstAddress: r['dst-address'] || '-',
+      protocol: r['ip-protocol'] || r.protocol || 'ip',
+      srcPort: r['src-port'] || '*',
+      dstPort: r['dst-port'] || '*',
+      rxMbps: Number((Number(r.rx || r['rx-bits-per-second'] || 0) / 1e6).toFixed(2)),
+      txMbps: Number((Number(r.tx || r['tx-bits-per-second'] || 0) / 1e6).toFixed(2)),
+    }))
+    .sort((a, b) => b.rxMbps + b.txMbps - (a.rxMbps + a.txMbps));
+}
+
+export function buildDualHomedWireGuardScript(params: {
+  secondaryEndpoint: string;
+  secondaryPort: number;
+  serverPublicKey: string;
+}): string {
+  return [
+    `/interface wireguard peers add interface=bro-wg public-key="${params.serverPublicKey}" endpoint-address="${params.secondaryEndpoint}" endpoint-port=${params.secondaryPort} allowed-address=10.77.0.0/16 persistent-keepalive=25s comment="BroRadius-Backup"`,
+    `/ip route add dst-address=10.77.0.1/32 gateway=bro-wg distance=2 comment="BroRadius-Backup-Route"`,
+  ].join('\n');
+}
+
+export function evaluateRouterSecurity(params: {
+  services: RosRow[];
+  users: RosRow[];
+  firewallInput: RosRow[];
+  prevKnownAdminNames: string[];
+}) {
+  const findings: Array<{ severity: 'critical' | 'warning' | 'ok'; title: string; detail: string }> = [];
+  let score = 100;
+
+  const dangerousSvcs = ['telnet', 'ftp', 'www'];
+  for (const s of params.services) {
+    const name = String(s.name || '').toLowerCase();
+    const disabled = s.disabled === 'true';
+    const addr = String(s.address || '');
+    if (dangerousSvcs.includes(name) && !disabled) {
+      score -= 12;
+      findings.push({
+        severity: 'warning',
+        title: `خدمة غير مشفّرة مفعّلة: ${name}`,
+        detail: `المنفذ ${s.port || '-'} مفتوح (${addr || '0.0.0.0/0'}) — يُفضّل تعطيله أو حصره في Access List.`,
+      });
+    }
+    if ((name === 'ssh' || name === 'winbox' || name === 'api') && !disabled && !addr) {
+      score -= 8;
+      findings.push({
+        severity: 'warning',
+        title: `الخدمة ${name} مفتوحة لكل العناوين`,
+        detail: `يفضل تقييد /ip service set ${name} address=10.77.0.0/16 أو شبكتك الإدارية.`,
+      });
+    }
+  }
+
+  const adminUsers = params.users.map((u) => ({
+    name: String(u.name || ''),
+    group: String(u.group || ''),
+    address: String(u.address || '0.0.0.0/0'),
+  }));
+  const currentNames = adminUsers.map((u) => u.name).filter(Boolean);
+  const newAdminUsersDetected =
+    params.prevKnownAdminNames.length > 0
+      ? currentNames.filter((n) => !params.prevKnownAdminNames.includes(n))
+      : [];
+
+  if (newAdminUsersDetected.length > 0) {
+    score -= 25;
+    findings.push({
+      severity: 'critical',
+      title: `حساب إدارة جديد على الراوتر: ${newAdminUsersDetected.join(', ')}`,
+      detail: 'تم رصد حساب مستخدم جديد في /user لم يكن موجوداً في اللقطة السابقة!',
+    });
+  }
+
+  if (adminUsers.some((u) => u.name === 'admin' && u.address === '0.0.0.0/0')) {
+    score -= 10;
+    findings.push({
+      severity: 'warning',
+      title: 'حساب admin الافتراضي نشط بدون حصر IP',
+      detail: 'يوصى بإنشاء مستخدم إداري باسم مخصص وحصر IP الوصول.',
+    });
+  }
+
+  const hasInputDrop = params.firewallInput.some((r) => r.chain === 'input' && r.action === 'drop' && r.disabled !== 'true');
+  if (!hasInputDrop) {
+    score -= 15;
+    findings.push({
+      severity: 'critical',
+      title: 'لا توجد قاعدة Firewall Drop في سلسلة input',
+      detail: 'حماية جدار الحماية للراوتر نفسه تحتاج قاعدة drop في نهاية chain=input.',
+    });
+  }
+
+  if (findings.length === 0) {
+    findings.push({
+      severity: 'ok',
+      title: 'إعدادات الأمان والخدمات سليمة',
+      detail: 'لم يتم رصد خدمات خطرة مفتوحة أو حسابات مشبوهة.',
+    });
+  }
+
+  return {
+    score: Math.max(0, Math.min(100, score)),
+    adminUsers,
+    newAdminUsersDetected,
+    findings,
+  };
+}
+

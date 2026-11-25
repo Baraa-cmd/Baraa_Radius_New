@@ -1,17 +1,23 @@
 import React, { useMemo, useState } from 'react';
 import {
+  AlertTriangle,
   ArrowDown,
   ArrowUp,
   Clock,
   CreditCard,
   Download,
   MapPin,
+  Moon,
   RefreshCw,
+  Router as RouterIcon,
   Search,
+  Signal,
   Users,
+  Wifi,
   X,
 } from 'lucide-react';
 import type { PaymentRecord, SubscriberBillingStatus, SubscriberRecord, TowerNode } from '../types';
+import { CpeDetailModal } from './CpeDetailModal';
 
 interface SubscribersHubViewProps {
   token: string;
@@ -43,14 +49,17 @@ export const SubscribersHubView: React.FC<SubscribersHubViewProps> = ({
   onLocateOnMap,
 }) => {
   const [period, setPeriod] = useState<'today' | 'week' | 'month'>('today');
+  const [quickFilter, setQuickFilter] = useState<'all' | 'flapping' | 'inactive' | 'debtor' | 'turbo'>('all');
   const [query, setQuery] = useState('');
   const [editingSub, setEditingSub] = useState<SubscriberRecord | null>(null);
+  const [cpeSub, setCpeSub] = useState<SubscriberRecord | null>(null);
   const [modalTab, setModalTab] = useState<'account' | 'payments'>('account');
 
   const [draftFullName, setDraftFullName] = useState('');
   const [draftPhone, setDraftPhone] = useState('');
   const [draftArea, setDraftArea] = useState('');
   const [draftProfile, setDraftProfile] = useState('default');
+  const [draftStaticIpPool, setDraftStaticIpPool] = useState('');
   const [draftStatus, setDraftStatus] = useState<SubscriberBillingStatus>('active');
   const [draftDebt, setDraftDebt] = useState('0');
   const [draftDisabled, setDraftDisabled] = useState(false);
@@ -67,21 +76,37 @@ export const SubscribersHubView: React.FC<SubscribersHubViewProps> = ({
     return { rx: s.rxMonthGb, tx: s.txMonthGb, total: s.rxMonthGb + s.txMonthGb };
   };
 
+  const filterCounts = useMemo(
+    () => ({
+      all: subscribers.length,
+      flapping: subscribers.filter((s) => s.flapCountToday >= 10).length,
+      inactive: subscribers.filter((s) => !s.online).length,
+      debtor: subscribers.filter((s) => s.billingStatus === 'debtor' || s.debtAmountIqd > 0).length,
+      turbo: subscribers.filter((s) => Boolean(s.turboNightEnabled)).length,
+    }),
+    [subscribers]
+  );
+
   const filteredSorted = useMemo(() => {
     const q = query.trim().toLowerCase();
     return [...subscribers]
-      .filter(
-        (s) =>
+      .filter((s) => {
+        if (quickFilter === 'flapping' && s.flapCountToday < 10) return false;
+        if (quickFilter === 'inactive' && s.online) return false;
+        if (quickFilter === 'debtor' && s.billingStatus !== 'debtor' && s.debtAmountIqd <= 0) return false;
+        if (quickFilter === 'turbo' && !s.turboNightEnabled) return false;
+        return (
           !q ||
           s.username.toLowerCase().includes(q) ||
           s.fullName.toLowerCase().includes(q) ||
           s.area.toLowerCase().includes(q) ||
           s.ip.includes(q) ||
           s.mac.toLowerCase().includes(q)
-      )
+        );
+      })
       .sort((a, b) => getUsage(b).total - getUsage(a).total);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [subscribers, query, period]);
+  }, [subscribers, query, period, quickFilter]);
 
   const grandTotalGb = useMemo(
     () => filteredSorted.reduce((acc, s) => acc + getUsage(s).total, 0),
@@ -98,6 +123,7 @@ export const SubscribersHubView: React.FC<SubscribersHubViewProps> = ({
     setDraftPhone(sub.phone);
     setDraftArea(sub.area);
     setDraftProfile(sub.profile);
+    setDraftStaticIpPool(sub.staticIpPool || '');
     setDraftStatus(sub.billingStatus);
     setDraftDebt(String(sub.debtAmountIqd));
     setDraftDisabled(sub.disabled);
@@ -114,6 +140,7 @@ export const SubscribersHubView: React.FC<SubscribersHubViewProps> = ({
         phone: draftPhone,
         area: draftArea,
         profile: draftProfile,
+        staticIpPool: draftStaticIpPool.trim() || null,
         disabled: draftDisabled,
         billingStatus: draftStatus,
         debtAmountIqd: Number(draftDebt) || 0,
@@ -228,16 +255,41 @@ export const SubscribersHubView: React.FC<SubscribersHubViewProps> = ({
         <RefreshCw className="w-5 h-5 text-sky-500" />
       </div>
 
-      {/* Search Bar */}
-      <div className="relative">
-        <Search className="w-4 h-4 text-slate-400 absolute right-4 top-1/2 -translate-y-1/2" />
-        <input
-          type="text"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          placeholder="بحث بالاسم، يوزر PPPoE، IP، MAC أو المنطقة"
-          className="w-full min-h-[48px] rounded-2xl border border-slate-200/80 dark:border-white/[0.08] bg-white dark:bg-[#11151E] pr-11 pl-4 text-sm text-slate-900 dark:text-white focus:outline-none focus:border-sky-500"
-        />
+      {/* Search Bar & Quick Operational Filters (#51, #54, #59) */}
+      <div className="space-y-2.5">
+        <div className="relative">
+          <Search className="w-4 h-4 text-slate-400 absolute right-4 top-1/2 -translate-y-1/2" />
+          <input
+            type="text"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="بحث بالاسم، يوزر PPPoE، IP، MAC أو المنطقة"
+            className="w-full min-h-[48px] rounded-2xl border border-slate-200/80 dark:border-white/[0.08] bg-white dark:bg-[#11151E] pr-11 pl-4 text-sm text-slate-900 dark:text-white focus:outline-none focus:border-sky-500"
+          />
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          {[
+            { id: 'all' as const, label: `الكل (${filterCounts.all})` },
+            { id: 'flapping' as const, label: `متقطع ≥10 اليوم (${filterCounts.flapping})` },
+            { id: 'inactive' as const, label: `خامل / غير متصل (${filterCounts.inactive})` },
+            { id: 'debtor' as const, label: `مديون (${filterCounts.debtor})` },
+            { id: 'turbo' as const, label: `توربو ليلي (${filterCounts.turbo})` },
+          ].map((chip) => (
+            <button
+              key={chip.id}
+              type="button"
+              onClick={() => setQuickFilter(chip.id)}
+              className={`min-h-[34px] px-3 rounded-xl text-xs font-bold border transition-colors ${
+                quickFilter === chip.id
+                  ? 'bg-sky-600 border-sky-600 text-white'
+                  : 'bg-white dark:bg-[#11151E] border-slate-200/80 dark:border-white/[0.08] text-slate-600 dark:text-slate-300'
+              }`}
+            >
+              {chip.label}
+            </button>
+          ))}
+        </div>
       </div>
 
       {subscribers.length === 0 ? (
@@ -289,6 +341,26 @@ export const SubscribersHubView: React.FC<SubscribersHubViewProps> = ({
                         {sub.debtAmountIqd > 0 && (
                           <span className="font-mono text-red-500">· {sub.debtAmountIqd.toLocaleString()} د.ع</span>
                         )}
+                        {sub.flapCountToday >= 5 && (
+                          <span className="inline-flex items-center gap-0.5 text-amber-500 font-bold">
+                            <AlertTriangle className="w-3 h-3" /> تقطع {sub.flapCountToday}×
+                          </span>
+                        )}
+                        {sub.turboNightEnabled && (
+                          <span className="inline-flex items-center gap-0.5 text-indigo-400 font-bold">
+                            <Moon className="w-3 h-3" /> توربو
+                          </span>
+                        )}
+                        {typeof sub.cpeConnectedCount === 'number' && sub.cpeConnectedCount > 0 && (
+                          <span className="inline-flex items-center gap-0.5 text-emerald-500 font-mono font-bold">
+                            <Wifi className="w-3 h-3" /> {sub.cpeConnectedCount} أجهزة
+                          </span>
+                        )}
+                        {typeof sub.signalDbm === 'number' && (
+                          <span className="inline-flex items-center gap-0.5 text-sky-500 font-mono" dir="ltr">
+                            <Signal className="w-3 h-3" /> {sub.signalDbm}dBm
+                          </span>
+                        )}
                       </div>
                     </div>
                   </div>
@@ -312,7 +384,7 @@ export const SubscribersHubView: React.FC<SubscribersHubViewProps> = ({
                   />
                 </div>
 
-                <div className="mt-2.5 flex items-center justify-between text-[11px] font-mono text-slate-500 dark:text-slate-400 tabular-nums">
+                <div className="mt-2.5 flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono text-slate-500 dark:text-slate-400 tabular-nums">
                   <span className="inline-flex items-center gap-3" dir="ltr">
                     <span className="inline-flex items-center gap-1">
                       <ArrowDown className="w-3 h-3 text-sky-500" /> {usage.rx.toFixed(1)} GB
@@ -322,17 +394,30 @@ export const SubscribersHubView: React.FC<SubscribersHubViewProps> = ({
                     </span>
                     <span>{sub.macVendor}</span>
                   </span>
-                  <button
-                    type="button"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onLocateOnMap(sub.id);
-                    }}
-                    className="font-sans font-bold text-sky-600 dark:text-sky-400 inline-flex items-center gap-1 hover:underline"
-                  >
-                    <MapPin className="w-3.5 h-3.5" />
-                    <span>الموقع</span>
-                  </button>
+                  <div className="flex items-center gap-3">
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setCpeSub(sub);
+                      }}
+                      className="font-sans font-bold text-teal-600 dark:text-teal-400 inline-flex items-center gap-1 hover:underline"
+                    >
+                      <RouterIcon className="w-3.5 h-3.5" />
+                      <span>راوتر المنزل</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onLocateOnMap(sub.id);
+                      }}
+                      className="font-sans font-bold text-sky-600 dark:text-sky-400 inline-flex items-center gap-1 hover:underline"
+                    >
+                      <MapPin className="w-3.5 h-3.5" />
+                      <span>الموقع</span>
+                    </button>
+                  </div>
                 </div>
               </div>
             );
@@ -465,7 +550,7 @@ export const SubscribersHubView: React.FC<SubscribersHubViewProps> = ({
                   </div>
                 </div>
 
-                <div className="grid grid-cols-2 gap-3">
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                   <div>
                     <label className="block text-xs font-semibold text-slate-600 dark:text-slate-300 mb-1">
                       المنطقة
@@ -475,6 +560,19 @@ export const SubscribersHubView: React.FC<SubscribersHubViewProps> = ({
                       value={draftArea}
                       onChange={(e) => setDraftArea(e.target.value)}
                       className="w-full min-h-[44px] rounded-xl border border-slate-200 dark:border-white/[0.09] bg-slate-50 dark:bg-[#171C28] px-3 text-sm text-slate-900 dark:text-white"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-600 dark:text-slate-300 mb-1">
+                      Static IP / Pool
+                    </label>
+                    <input
+                      type="text"
+                      dir="ltr"
+                      value={draftStaticIpPool}
+                      onChange={(e) => setDraftStaticIpPool(e.target.value)}
+                      placeholder="10.20.0.50 أو pool-vip"
+                      className="w-full min-h-[44px] rounded-xl border border-slate-200 dark:border-white/[0.09] bg-slate-50 dark:bg-[#171C28] px-3 text-sm font-mono text-left text-slate-900 dark:text-white"
                     />
                   </div>
                   <div>
@@ -625,6 +723,15 @@ export const SubscribersHubView: React.FC<SubscribersHubViewProps> = ({
             )}
           </div>
         </div>
+      )}
+
+      {cpeSub && (
+        <CpeDetailModal
+          token={token}
+          subscriber={cpeSub}
+          onClose={() => setCpeSub(null)}
+          onUpdateSubscriber={onUpdateSubscriber}
+        />
       )}
     </div>
   );

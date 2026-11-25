@@ -27,9 +27,15 @@ export interface RouterPort {
   txBytesToday: number;
   rxErrors: number;
   rxDrops: number;
+  txDrops?: number;
+  poeStatus?: string | null;
+  poeWatts?: number | null;
+  poeVoltage?: number | null;
   sfpTempC: number | null;
   sfpRxDbm: number | null;
   sfpTxDbm: number | null;
+  sfpVoltageV?: number | null;
+  sfpBiasMa?: number | null;
   disconnectCount: number;
   lastDisconnect?: string;
 }
@@ -133,7 +139,6 @@ export interface RouterDevice {
   tunnelRttMs: number | null;
   status: RouterStatus;
   lastError: string | null;
-  // Auto-fetched hardware & OS fields (null until real router syncs)
   identity: string | null;
   model: string | null;
   boardName: string | null;
@@ -202,6 +207,16 @@ export interface SubscriberRecord {
   activatedAt: string | null;
   expiresAt: string | null;
   expiresInDays: number;
+  graceExpiresAt?: string | null;
+  turboNightEnabled?: boolean;
+  turboProfile?: string | null;
+  baseProfile?: string | null;
+  staticIpPool?: string | null;
+  rfRadioId?: string | null;
+  signalDbm?: number | null;
+  distanceKm?: number | null;
+  cpeConnectedCount?: number;
+  cpeModel?: string | null;
   towerId: string | null;
   lat: number | null;
   lng: number | null;
@@ -226,6 +241,11 @@ export interface TowerNode {
   azimuthDeg: number;
   beamwidthDeg: number;
   radiusMeters: number;
+  healthScore?: number;
+  onlineRadios?: number;
+  totalRadios?: number;
+  onlineSubs?: number;
+  totalSubs?: number;
 }
 
 export interface AuditLogEntry {
@@ -243,6 +263,16 @@ export interface NotificationSettings {
   telegramChatId: string;
   hasTelegramToken: boolean;
   dailyDigestEnabled: boolean;
+  turboNightEnabled?: boolean;
+  turboStartHour?: number;
+  turboEndHour?: number;
+  turboDefaultProfile?: string;
+  genieacsUrl?: string;
+  genieacsUser?: string;
+  hasGenieacsPass?: boolean;
+  radiusHost?: string;
+  radiusCoaPort?: number;
+  hasRadiusSecret?: boolean;
 }
 
 export interface TeamMember {
@@ -250,6 +280,7 @@ export interface TeamMember {
   name: string;
   email: string;
   role: UserRole;
+  allowedTowerIds: string[];
   createdAt: string;
 }
 
@@ -273,11 +304,12 @@ export interface AuthUser {
   email: string;
   networkName: string;
   role: UserRole;
+  allowedTowerIds?: string[];
 }
 
 export interface DiagnosticDataset {
   ipAddresses: Array<{ address: string; network: string; iface: string }>;
-  routes: Array<{ dst: string; gateway: string; distance: string }>;
+  routes: Array<{ dst: string; gateway: string; distance: string; active?: boolean; disabled?: boolean; comment?: string; id?: string }>;
   dhcpLeases: Array<{ address: string; mac: string; hostName: string; status: string }>;
   arpTable: Array<{ address: string; mac: string; iface: string }>;
   pppoeServers: Array<{ serviceName: string; iface: string; maxMtu: string }>;
@@ -285,10 +317,15 @@ export interface DiagnosticDataset {
   hotspotActive: Array<{ user: string; address: string; uptime: string }>;
   simpleQueues: Array<{ name: string; target: string; maxLimit: string }>;
   vlans: Array<{ name: string; vlanId: string; iface: string }>;
+  bridgePorts?: Array<{ iface: string; bridge: string; pvid: string; status: string }>;
   wirelessClients: Array<{ mac: string; iface: string; signal: string; txRate: string }>;
   services: Array<{ name: string; port: string; disabled: boolean }>;
   dnsSettings: { servers: string; allowRemoteRequests: boolean; cacheUsedKb: number; cacheSizeKb: number };
   logs: Array<{ time: string; topics: string; message: string }>;
+  ipPools?: Array<{ name: string; ranges: string; usedCount: number; totalApprox: number }>;
+  arpConflicts?: Array<{ ip: string; macs: string[] }>;
+  rogueDhcpAlerts?: Array<{ iface: string; mac: string; validServer: string; time: string }>;
+  ntpStatus?: { enabled: boolean; servers: string; status: string; syncedServer?: string };
 }
 
 export interface ServerCapabilities {
@@ -312,3 +349,165 @@ export interface VpsRelayStatus {
   lastError: string | null;
   activePeersCount?: number;
 }
+
+export type RfVendor = 'mikrotik' | 'ubiquiti' | 'mimosa' | 'cambium';
+export type RfProtocol = 'ros' | 'snmp' | 'airos';
+
+export interface RfStationClient {
+  mac: string;
+  signalDbm: number | null;
+  chain0Dbm?: number | null;
+  chain1Dbm?: number | null;
+  ccqPct?: number | null;
+  txRateMbps?: number | null;
+  rxRateMbps?: number | null;
+  distanceKm?: number | null;
+  uptime?: string;
+  iface?: string;
+  subscriberId?: string | null;
+  subscriberUsername?: string | null;
+}
+
+export interface RfRadioDevice {
+  id: string;
+  ownerId: string;
+  routerId: string | null;
+  towerId: string | null;
+  name: string;
+  host: string;
+  vendor: RfVendor;
+  protocol: RfProtocol;
+  port: number;
+  status: 'online' | 'offline' | 'pending';
+  lastError: string | null;
+  model: string | null;
+  ssid: string | null;
+  frequencyMhz: number | null;
+  channelWidthMhz: number | null;
+  txPowerDbm: number | null;
+  ccqPct: number | null;
+  airtimePct: number | null;
+  signalDbm: number | null;
+  noiseFloorDbm: number | null;
+  snrDb: number | null;
+  chain0Dbm: number | null;
+  chain1Dbm: number | null;
+  chainImbalanceDb: number | null;
+  txRateMbps: number | null;
+  rxRateMbps: number | null;
+  distanceKm: number | null;
+  lanSpeed: string | null;
+  clients: RfStationClient[];
+  lastSync: string | null;
+}
+
+export interface RfSignalSample {
+  id: number;
+  radioId: string;
+  signalDbm: number | null;
+  noiseFloorDbm: number | null;
+  ccqPct: number | null;
+  airtimePct: number | null;
+  recordedAt: string;
+}
+
+export interface CpeConnectedHost {
+  mac: string;
+  ip: string;
+  hostname: string;
+  vendor: string;
+  deviceType: 'phone' | 'laptop' | 'tv' | 'console' | 'camera' | 'router' | 'unknown';
+  rssiDbm: number | null;
+  band: '2.4GHz' | '5GHz' | 'LAN' | 'Unknown';
+  active: boolean;
+  rxBytes?: number;
+  txBytes?: number;
+  ttlHint?: number;
+  blocked?: boolean;
+}
+
+export interface CpeDeviceInfo {
+  subscriberId: string;
+  source: 'genieacs' | 'mikrotik_conntrack' | 'unconfigured';
+  tr069DeviceId: string | null;
+  cpeHost: string | null;
+  cpePort: number;
+  model: string | null;
+  serialNumber: string | null;
+  firmware: string | null;
+  uptimeSec: number | null;
+  cpuPct: number | null;
+  ramPct: number | null;
+  wanIp: string | null;
+  wifiSsid24: string | null;
+  wifiChannel24: string | null;
+  wifiSsid5: string | null;
+  wifiChannel5: string | null;
+  connectedCount: number;
+  connectedHosts: CpeConnectedHost[];
+  tr143DownMbps: number | null;
+  tr143UpMbps: number | null;
+  lastSyncedAt: string | null;
+  hasConfigBackup: boolean;
+}
+
+export interface SubscriberSessionRecord {
+  id: number;
+  subscriberId: string;
+  ip: string;
+  mac: string;
+  loginAt: string;
+  logoutAt: string | null;
+  durationSec: number;
+  rxGb: number;
+  txGb: number;
+  disconnectCause: string;
+}
+
+export interface TorchEntry {
+  srcAddress: string;
+  dstAddress: string;
+  protocol: string;
+  srcPort: string;
+  dstPort: string;
+  rxMbps: number;
+  txMbps: number;
+}
+
+export interface LatencyProbeRecord {
+  id: number;
+  routerId: string;
+  target: string;
+  label: string;
+  latencyMs: number | null;
+  packetLossPct: number;
+  recordedAt: string;
+}
+
+export interface FailoverEventRecord {
+  id: number;
+  routerId: string;
+  routerName: string;
+  fromGateway: string;
+  toGateway: string;
+  reason: string;
+  createdAt: string;
+}
+
+export interface ConfigDiffRecord {
+  id: string;
+  routerId: string;
+  summary: string;
+  addedCount: number;
+  removedCount: number;
+  diffLines: Array<{ type: 'add' | 'del' | 'ctx'; text: string }>;
+  createdAt: string;
+}
+
+export interface SecurityAuditResult {
+  score: number;
+  adminUsers: Array<{ name: string; group: string; address: string }>;
+  newAdminUsersDetected: string[];
+  findings: Array<{ severity: 'critical' | 'warning' | 'ok'; title: string; detail: string }>;
+}
+

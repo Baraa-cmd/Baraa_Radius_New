@@ -77,7 +77,7 @@ WG_SERVER_PORT=51820
 SESSION_SECRET=${SECRET_HEX}
 EOF
 
-npm install
+npm install --legacy-peer-deps
 npm run build
 
 echo "==> Creating systemd service (bro-radius)..."

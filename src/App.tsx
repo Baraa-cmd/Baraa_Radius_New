@@ -5,6 +5,7 @@ import {
   Moon,
   Network,
   Plus,
+  Radio,
   Router,
   Settings,
   Sun,
@@ -16,6 +17,7 @@ import { BroLogo } from './components/BroLogo';
 import { DirectManagementModal } from './components/DirectManagementModal';
 import { NetworkHomeView } from './components/NetworkHomeView';
 import { OfflineIndicator, PWAInstallButton } from './components/PWAInstallButton';
+import { RfWirelessView } from './components/RfWirelessView';
 import { RouterDetailView } from './components/RouterDetailView';
 import { SettingsView } from './components/SettingsView';
 import { SubscribersHubView } from './components/SubscribersHubView';
@@ -23,6 +25,7 @@ import { SubscribersMapView } from './components/SubscribersMapView';
 import type {
   AuthUser,
   PaymentRecord,
+  RfRadioDevice,
   RouterAlertItem,
   RouterDevice,
   SubscriberRecord,
@@ -30,29 +33,13 @@ import type {
   TowerNode,
 } from './types';
 
-type MainTab = 'network' | 'subscribers' | 'map' | 'settings';
-
-const SESSION_STORAGE_KEY = 'bro_radius_session_v1';
-
-function loadStoredSession(): { token: string; user: AuthUser } | null {
-  try {
-    const raw = localStorage.getItem(SESSION_STORAGE_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as { token?: string; user?: AuthUser };
-    if (parsed?.token && parsed?.user?.id) {
-      return { token: parsed.token, user: parsed.user };
-    }
-  } catch {
-    // Ignore storage errors
-  }
-  return null;
-}
+type MainTab = 'network' | 'rf' | 'subscribers' | 'map' | 'settings';
 
 export default function App() {
   const [theme, setTheme] = useState<ThemeMode>('dark');
-  const [initialSession] = useState(() => loadStoredSession());
-  const [token, setToken] = useState<string | null>(initialSession?.token || null);
-  const [user, setUser] = useState<AuthUser | null>(initialSession?.user || null);
+  const [bootingAuth, setBootingAuth] = useState(true);
+  const [token, setToken] = useState<string | null>(null);
+  const [user, setUser] = useState<AuthUser | null>(null);
 
   const [activeTab, setActiveTab] = useState<MainTab>('network');
   const [selectedRouterId, setSelectedRouterId] = useState<string | null>(null);
@@ -60,6 +47,7 @@ export default function App() {
 
   const [routers, setRouters] = useState<RouterDevice[]>([]);
   const [subscribers, setSubscribers] = useState<SubscriberRecord[]>([]);
+  const [rfRadios, setRfRadios] = useState<RfRadioDevice[]>([]);
   const [alerts, setAlerts] = useState<RouterAlertItem[]>([]);
   const [towers, setTowers] = useState<TowerNode[]>([]);
   const [payments, setPayments] = useState<PaymentRecord[]>([]);
@@ -74,11 +62,6 @@ export default function App() {
   const seenAlertIdsRef = useRef<Set<string>>(new Set());
 
   const clearSession = useCallback(() => {
-    try {
-      localStorage.removeItem(SESSION_STORAGE_KEY);
-    } catch {
-      // Ignore storage errors
-    }
     setToken(null);
     setUser(null);
     setSelectedRouterId(null);
@@ -94,56 +77,83 @@ export default function App() {
     }
   }, [theme]);
 
-  const loadDashboard = useCallback(async (authToken: string) => {
-    setLoadingDashboard(true);
-    try {
-      const res = await fetch('/api/dashboard', {
-        headers: { Authorization: `Bearer ${authToken}` },
-      });
-      if (res.status === 401) {
-        clearSession();
-        return;
-      }
-      if (res.ok) {
-        const data = await res.json();
-        const incomingAlerts = (data.alerts || []) as RouterAlertItem[];
-        setRouters(data.routers || []);
-        setSubscribers(data.subscribers || []);
-        setAlerts(incomingAlerts);
-        setTowers(data.towers || []);
-        setPayments(data.payments || []);
-        setHotspotVouchers(data.hotspotVouchers || []);
+  const loadDashboard = useCallback(
+    async (authToken: string) => {
+      setLoadingDashboard(true);
+      try {
+        const res = await fetch('/api/dashboard', {
+          credentials: 'include',
+          headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
+        });
+        if (res.status === 401) {
+          clearSession();
+          return;
+        }
+        if (res.ok) {
+          const data = await res.json();
+          const incomingAlerts = (data.alerts || []) as RouterAlertItem[];
+          setRouters(data.routers || []);
+          setSubscribers(data.subscribers || []);
+          setRfRadios(data.rfRadios || []);
+          setAlerts(incomingAlerts);
+          setTowers(data.towers || []);
+          setPayments(data.payments || []);
+          setHotspotVouchers(data.hotspotVouchers || []);
 
-        // Browser Web Notification for newly arrived unread alerts (#71)
-        if ('Notification' in window && Notification.permission === 'granted') {
-          for (const alt of incomingAlerts) {
-            if (!alt.acknowledged && !seenAlertIdsRef.current.has(alt.id)) {
-              seenAlertIdsRef.current.add(alt.id);
-              if (seenAlertIdsRef.current.size > 1) {
-                new Notification(`Bro Radius · ${alt.routerName}`, { body: alt.title });
+          if ('Notification' in window && Notification.permission === 'granted') {
+            for (const alt of incomingAlerts) {
+              if (!alt.acknowledged && !seenAlertIdsRef.current.has(alt.id)) {
+                seenAlertIdsRef.current.add(alt.id);
+                if (seenAlertIdsRef.current.size > 1) {
+                  new Notification(`Bro Radius · ${alt.routerName}`, { body: alt.title });
+                }
               }
             }
+          } else {
+            incomingAlerts.forEach((a) => seenAlertIdsRef.current.add(a.id));
           }
-        } else {
-          incomingAlerts.forEach((a) => seenAlertIdsRef.current.add(a.id));
         }
+      } finally {
+        setLoadingDashboard(false);
       }
-    } finally {
-      setLoadingDashboard(false);
-    }
-  }, [clearSession]);
+    },
+    [clearSession]
+  );
 
+  // Restore HttpOnly cookie session on initial load without localStorage tokens
   useEffect(() => {
-    if (initialSession?.token) {
-      void loadDashboard(initialSession.token);
-    }
-  }, [initialSession?.token, loadDashboard]);
+    let active = true;
+    void (async () => {
+      try {
+        const res = await fetch('/api/auth/me', {
+          credentials: 'include',
+          cache: 'no-store',
+        });
+        if (active && res.ok) {
+          const data = (await res.json()) as { token?: string; user?: AuthUser };
+          if (data.user && data.token) {
+            setToken(data.token);
+            setUser(data.user);
+            void loadDashboard(data.token);
+          }
+        }
+      } catch {
+        // Ignore session bootstrap errors
+      } finally {
+        if (active) setBootingAuth(false);
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [loadDashboard]);
 
   useEffect(() => {
     if (!token) return;
     const keepAlive = () => {
       void fetch('/api/capabilities', {
         cache: 'no-store',
+        credentials: 'include',
         headers: { Authorization: `Bearer ${token}` },
       }).catch(() => undefined);
     };
@@ -160,17 +170,13 @@ export default function App() {
 
   const handleAuthenticated = (newToken: string, newUser: AuthUser) => {
     seenAlertIdsRef.current.clear();
-    try {
-      localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify({ token: newToken, user: newUser }));
-    } catch {
-      // Ignore storage errors
-    }
     setToken(newToken);
     setUser(newUser);
     void loadDashboard(newToken);
   };
 
   const handleLogout = () => {
+    void fetch('/api/auth/logout', { method: 'POST', credentials: 'include' }).catch(() => undefined);
     clearSession();
   };
 
@@ -192,6 +198,7 @@ export default function App() {
     if (!token) return;
     const res = await fetch(`/api/routers/${routerId}`, {
       method: 'DELETE',
+      credentials: 'include',
       headers: { Authorization: `Bearer ${token}` },
     });
     if (res.ok) {
@@ -206,6 +213,7 @@ export default function App() {
     setAlerts((prev) => prev.map((a) => (a.id === alertId ? { ...a, acknowledged: true } : a)));
     await fetch(`/api/alerts/${alertId}/ack`, {
       method: 'POST',
+      credentials: 'include',
       headers: { Authorization: `Bearer ${token}` },
     });
   };
@@ -217,6 +225,7 @@ export default function App() {
     if (!token) return;
     const res = await fetch(`/api/subscribers/${subId}`, {
       method: 'PATCH',
+      credentials: 'include',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${token}`,
@@ -233,6 +242,7 @@ export default function App() {
     if (!token) return;
     const res = await fetch(`/api/subscribers/${subId}/disconnect`, {
       method: 'POST',
+      credentials: 'include',
       headers: { Authorization: `Bearer ${token}` },
     });
     if (res.ok) {
@@ -250,6 +260,7 @@ export default function App() {
     if (!token) return;
     const res = await fetch(`/api/subscribers/${subId}/payments`, {
       method: 'POST',
+      credentials: 'include',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${token}`,
@@ -267,6 +278,7 @@ export default function App() {
     if (!token) return;
     const res = await fetch('/api/towers', {
       method: 'POST',
+      credentials: 'include',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${token}`,
@@ -283,12 +295,22 @@ export default function App() {
     if (!token) return;
     const res = await fetch(`/api/towers/${towerId}`, {
       method: 'DELETE',
+      credentials: 'include',
       headers: { Authorization: `Bearer ${token}` },
     });
     if (res.ok) {
       setTowers((prev) => prev.filter((t) => t.id !== towerId));
     }
   };
+
+  if (bootingAuth) {
+    return (
+      <div className="min-h-screen bg-[#090B10] flex flex-col items-center justify-center gap-3 text-slate-300">
+        <BroLogo size="lg" />
+        <div className="text-xs font-bold tracking-wide text-slate-400">جاري التحقق من الجلسة...</div>
+      </div>
+    );
+  }
 
   if (!token || !user) {
     return (
@@ -302,16 +324,17 @@ export default function App() {
   const openAlertCount = alerts.filter((a) => !a.acknowledged).length;
   const selectedRouter = routers.find((r) => r.id === selectedRouterId) || null;
 
-  const navItems: Array<{ id: MainTab; label: string; icon: typeof Network }> = [
-    { id: 'network', label: 'شبكتي', icon: Network },
-    { id: 'subscribers', label: 'المشتركين', icon: Users },
-    { id: 'map', label: 'الخريطة', icon: MapPin },
-    { id: 'settings', label: 'الإعدادات', icon: Settings },
+  const navItems: Array<{ id: MainTab; label: string; shortLabel: string; icon: typeof Network }> = [
+    { id: 'network', label: 'شبكتي', shortLabel: 'شبكتي', icon: Network },
+    { id: 'rf', label: 'الترددات والراديوهات', shortLabel: 'الترددات', icon: Radio },
+    { id: 'subscribers', label: 'المشتركين', shortLabel: 'المشتركين', icon: Users },
+    { id: 'map', label: 'الخريطة', shortLabel: 'الخريطة', icon: MapPin },
+    { id: 'settings', label: 'الإعدادات', shortLabel: 'الإعدادات', icon: Settings },
   ];
 
   return (
     <div className="min-h-screen bg-[#F4F6FA] dark:bg-[#090B10] text-slate-900 dark:text-slate-100 flex flex-col lg:flex-row">
-      {/* Desktop Sidebar (Master List + Nav #96) */}
+      {/* Desktop Sidebar */}
       <aside className="hidden lg:flex lg:flex-col lg:w-64 lg:shrink-0 border-l border-slate-200/80 dark:border-white/[0.07] bg-white dark:bg-[#0D1017] sticky top-0 h-screen p-5 justify-between">
         <div className="space-y-6">
           <div className="flex items-center gap-3 px-1">
@@ -353,6 +376,11 @@ export default function App() {
                       {openAlertCount}
                     </span>
                   )}
+                  {item.id === 'rf' && rfRadios.length > 0 && (
+                    <span className="font-mono text-[11px] font-bold px-2 py-0.5 rounded-md bg-white/15">
+                      {rfRadios.length}
+                    </span>
+                  )}
                 </button>
               );
             })}
@@ -369,7 +397,7 @@ export default function App() {
                 <Plus className="w-3.5 h-3.5" /> إضافة
               </button>
             </div>
-            <div className="space-y-1">
+            <div className="space-y-1 max-h-56 overflow-y-auto">
               {routers.map((r) => (
                 <button
                   key={r.id}
@@ -473,6 +501,8 @@ export default function App() {
               router={selectedRouter}
               subscribers={subscribers}
               alerts={alerts}
+              rfRadios={rfRadios}
+              towers={towers}
               onBack={() => setSelectedRouterId(null)}
               onUpdateRouter={handleUpdateRouter}
               onDeleteRouter={handleDeleteRouter}
@@ -481,6 +511,7 @@ export default function App() {
               onToggleSubscriberDisabled={(subId, disabled) =>
                 handleUpdateSubscriber(subId, { disabled })
               }
+              onUpdateSubscriber={handleUpdateSubscriber}
             />
           ) : activeTab === 'network' ? (
             <NetworkHomeView
@@ -492,6 +523,15 @@ export default function App() {
               onSelectRouter={(id) => setSelectedRouterId(id)}
               onOpenAddRouter={() => setShowAddRouter(true)}
               onOpenDirectManage={() => setShowDirectManage(true)}
+            />
+          ) : activeTab === 'rf' ? (
+            <RfWirelessView
+              token={token}
+              radios={rfRadios}
+              routers={routers}
+              towers={towers}
+              onRadiosChanged={setRfRadios}
+              onRefreshDashboard={() => void loadDashboard(token)}
             />
           ) : activeTab === 'subscribers' ? (
             <SubscribersHubView
@@ -521,6 +561,7 @@ export default function App() {
               token={token}
               user={user}
               theme={theme}
+              towers={towers}
               onToggleTheme={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}
               alerts={alerts}
               onAckAlert={(id) => void handleAckAlert(id)}
@@ -532,7 +573,7 @@ export default function App() {
       </main>
 
       {/* Mobile Bottom Tab Bar */}
-      <nav className="lg:hidden fixed bottom-0 left-0 right-0 z-40 h-[60px] pb-safe bg-white/95 dark:bg-[#0D1017]/95 backdrop-blur-md border-t border-slate-200/80 dark:border-white/[0.07] grid grid-cols-4 items-center">
+      <nav className="lg:hidden fixed bottom-0 left-0 right-0 z-40 h-[60px] pb-safe bg-white/95 dark:bg-[#0D1017]/95 backdrop-blur-md border-t border-slate-200/80 dark:border-white/[0.07] grid grid-cols-5 items-center">
         {navItems.map((item) => {
           const Icon = item.icon;
           const active = activeTab === item.id && !selectedRouter;
@@ -549,7 +590,7 @@ export default function App() {
               }`}
             >
               <Icon className="w-5 h-5" />
-              <span className="text-[11px] font-bold">{item.label}</span>
+              <span className="text-[10px] font-bold truncate max-w-full px-1">{item.shortLabel}</span>
             </button>
           );
         })}
